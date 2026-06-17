@@ -1,0 +1,1465 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Wireshark 抓包分析工具 (GUI版)
+支持 pcap / pcapng 格式
+功能：
+  - 拖拽或选择抓包文件
+  - 深度分析：协议识别、TCP三次握手、TLS证书、错误告警
+  - 分步骤展示分析结果
+  - 一键重新分析
+"""
+
+import os
+import sys
+import re
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from collections import Counter, defaultdict
+from datetime import datetime
+import threading
+
+# ===================== 依赖检查 =====================
+try:
+    from scapy.all import rdpcap, IP, IPv6, TCP, UDP, ARP, ICMP, DNS, DNSQR, Raw, Ether
+    try:
+        from scapy.layers.http import HTTPRequest, HTTPResponse
+    except ImportError:
+        HTTPRequest = HTTPResponse = None
+    try:
+        from scapy.layers.tls.record import TLS
+        from scapy.layers.tls.handshake import TLSClientHello, TLSServerHello, TLSCertificate
+        from scapy.layers.tls.extensions import TLS_Ext_ServerName
+        TLS_AVAILABLE = True
+    except ImportError:
+        TLS = TLSClientHello = TLSServerHello = TLSCertificate = TLS_Ext_ServerName = None
+        TLS_AVAILABLE = False
+    SCAPY_AVAILABLE = True
+except ImportError:
+    SCAPY_AVAILABLE = False
+    TLS_AVAILABLE = False
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    DND_AVAILABLE = True
+except ImportError:
+    DND_AVAILABLE = False
+
+# ===================== 颜色主题（浅色） =====================
+COLORS = {
+    'bg': '#f5f7fa',
+    'card': '#ffffff',
+    'primary': '#0288d1',
+    'primary_light': '#e3f2fd',
+    'primary_hover': '#b3e5fc',
+    'text': '#263238',
+    'text_secondary': '#546e7a',
+    'border': '#bbdefb',
+    'success': '#43a047',
+    'warning': '#fb8c00',
+    'danger': '#e53935',
+}
+
+
+# ===================== 分析引擎 =====================
+class PacketAnalyzer:
+    def __init__(self, file_path, config=None):
+        self.file_path = file_path
+        self.config = config or {}
+        self.packets = []
+        self.stats = {}
+        self.error_msg = None
+        self.pkt_infos = []
+        self._tcp_handshake_cache = None
+        self._tls_cache = None
+
+    def load(self):
+        try:
+            self.packets = rdpcap(self.file_path)
+            return True
+        except Exception as e:
+            self.error_msg = str(e)
+            return False
+
+    def analyze(self):
+        if not self.packets:
+            return {}
+        self._preprocess()
+        self._tcp_handshake_cache = self._analyze_tcp_handshake()
+        self._tls_cache = self._analyze_tls()
+        stats = {
+            'file_info': self._analyze_file_info(),
+            'protocol': self._analyze_protocol(),
+            'traffic_timeline': self._analyze_traffic_timeline(),
+            'tcp_handshake': self._tcp_handshake_cache,
+            'tls_analysis': self._tls_cache,
+            'errors': self._analyze_errors(),
+            'ip_comm': self._analyze_ip_communication(),
+            'port_session': self._analyze_port_session(),
+            'conclusion': '',
+        }
+        stats['conclusion'] = self._generate_conclusion(stats)
+        self.stats = stats
+        return stats
+
+    # ---------- 预处理 ----------
+    def _preprocess(self):
+        self.pkt_infos = []
+        for idx, p in enumerate(self.packets):
+            info = {
+                'idx': idx + 1,
+                'time': float(p.time),
+                'len': len(p),
+                'layers': [],
+                'src_ip': None,
+                'dst_ip': None,
+                'src_port': None,
+                'dst_port': None,
+                'proto': None,
+                'tcp_flags': None,
+                'tcp_seq': None,
+                'tcp_ack': None,
+                'tcp_window': None,
+                'http_request': None,
+                'http_response': None,
+                'dns_qry': None,
+                'dns_rcode': None,
+                'icmp_type': None,
+                'icmp_code': None,
+                'tls_info': None,
+                'is_retransmission': False,
+                'is_dup_ack': False,
+            }
+
+            if p.haslayer(Ether):
+                info['layers'].append('Ethernet')
+            if p.haslayer(ARP):
+                info['layers'].append('ARP')
+                info['proto'] = 'ARP'
+            if p.haslayer(IP):
+                info['layers'].append('IP')
+                info['src_ip'] = p[IP].src
+                info['dst_ip'] = p[IP].dst
+            if p.haslayer(IPv6):
+                info['layers'].append('IPv6')
+                info['src_ip'] = p[IPv6].src
+                info['dst_ip'] = p[IPv6].dst
+            if p.haslayer(ICMP):
+                info['layers'].append('ICMP')
+                info['proto'] = 'ICMP'
+                info['icmp_type'] = p[ICMP].type
+                info['icmp_code'] = p[ICMP].code
+            if p.haslayer(TCP):
+                info['layers'].append('TCP')
+                info['proto'] = 'TCP'
+                tcp = p[TCP]
+                info['src_port'] = tcp.sport
+                info['dst_port'] = tcp.dport
+                info['tcp_flags'] = tcp.sprintf('%TCP.flags%')
+                info['tcp_seq'] = tcp.seq
+                info['tcp_ack'] = tcp.ack
+                info['tcp_window'] = tcp.window
+
+                # HTTP detection
+                if HTTPRequest and p.haslayer(HTTPRequest):
+                    info['layers'].append('HTTP')
+                    info['proto'] = 'HTTP'
+                    req = p[HTTPRequest]
+                    info['http_request'] = {
+                        'method': req.Method.decode() if isinstance(req.Method, bytes) else str(req.Method),
+                        'host': req.Host.decode() if isinstance(req.Host, bytes) else str(req.Host),
+                        'path': req.Path.decode() if isinstance(req.Path, bytes) else str(req.Path),
+                    }
+                elif HTTPResponse and p.haslayer(HTTPResponse):
+                    info['layers'].append('HTTP')
+                    info['proto'] = 'HTTP'
+                    resp = p[HTTPResponse]
+                    status = resp.Status_Code
+                    info['http_response'] = {
+                        'status': status.decode() if isinstance(status, bytes) else str(status),
+                    }
+                elif info['dst_port'] in (80, 8080, 8000, 3128, 8888) or info['src_port'] in (80, 8080, 8000, 3128, 8888):
+                    info['layers'].append('HTTP')
+                    info['proto'] = 'HTTP'
+
+                # TLS detection
+                tls_ports = (443, 8443, 465, 587, 993, 995, 3389)
+                if info['dst_port'] in tls_ports or info['src_port'] in tls_ports:
+                    if TLS_AVAILABLE and p.haslayer(TLS):
+                        info['layers'].append('TLS')
+                        info['proto'] = 'TLS'
+                        info['tls_info'] = self._parse_tls_layer(p[TLS])
+                    else:
+                        info['layers'].append('TLS')
+                        info['proto'] = 'TLS'
+
+            if p.haslayer(UDP):
+                info['layers'].append('UDP')
+                if info['proto'] is None:
+                    info['proto'] = 'UDP'
+                udp = p[UDP]
+                info['src_port'] = udp.sport
+                info['dst_port'] = udp.dport
+                if p.haslayer(DNS):
+                    info['layers'].append('DNS')
+                    info['proto'] = 'DNS'
+                    dns = p[DNS]
+                    info['dns_rcode'] = dns.rcode
+                    if p.haslayer(DNSQR):
+                        qname = p[DNSQR].qname
+                        if isinstance(qname, bytes):
+                            qname = qname.decode('utf-8', errors='ignore').rstrip('.')
+                        info['dns_qry'] = qname
+
+            if info['proto'] is None:
+                info['proto'] = 'Other'
+
+            self.pkt_infos.append(info)
+
+        self._mark_retransmissions()
+
+    def _parse_tls_layer(self, tls):
+        result = {'type': 'Unknown'}
+        if TLSClientHello and tls.haslayer(TLSClientHello):
+            ch = tls[TLSClientHello]
+            result['type'] = 'ClientHello'
+            try:
+                result['version'] = ch.version.name if hasattr(ch.version, 'name') else str(ch.version)
+            except Exception:
+                result['version'] = str(ch.version)
+            sni = []
+            try:
+                for ext in ch.ext or []:
+                    if TLS_Ext_ServerName and ext.haslayer(TLS_Ext_ServerName):
+                        for sn in ext.servernames:
+                            name = getattr(sn, 'servername', b'')
+                            if isinstance(name, bytes):
+                                name = name.decode('utf-8', errors='ignore')
+                            if name:
+                                sni.append(name)
+            except Exception:
+                pass
+            result['sni'] = sni
+        elif TLSServerHello and tls.haslayer(TLSServerHello):
+            sh = tls[TLSServerHello]
+            result['type'] = 'ServerHello'
+            try:
+                result['version'] = sh.version.name if hasattr(sh.version, 'name') else str(sh.version)
+            except Exception:
+                result['version'] = str(sh.version)
+            try:
+                result['cipher'] = sh.cipher.name if hasattr(sh.cipher, 'name') else str(sh.cipher)
+            except Exception:
+                result['cipher'] = str(sh.cipher)
+        elif TLSCertificate and tls.haslayer(TLSCertificate):
+            result['type'] = 'Certificate'
+            try:
+                certs = tls[TLSCertificate].certs
+                result['cert_count'] = len(certs)
+            except Exception:
+                result['cert_count'] = 0
+        return result
+
+    def _ip_match(self, ip):
+        targets = self.config.get('target_ips', [])
+        if not targets:
+            return False
+        return ip in targets
+
+    def _error_match(self, category, detail):
+        focus = self.config.get('focus_errors', [])
+        if not focus:
+            return False
+        text = f"{category} {detail}"
+        for kw in focus:
+            if kw and kw.lower() in text.lower():
+                return True
+        return False
+
+    def _mark_retransmissions(self):
+        flow_packets = defaultdict(list)
+        for info in self.pkt_infos:
+            if info['proto'] in ('TCP', 'HTTP', 'TLS') and info['tcp_seq'] is not None:
+                key = tuple(sorted([(info['src_ip'], info['src_port']), (info['dst_ip'], info['dst_port'])]))
+                flow_packets[key].append(info)
+
+        for flow, pkts in flow_packets.items():
+            pkts.sort(key=lambda x: x['time'])
+            seen_seq = defaultdict(list)
+            seen_ack = defaultdict(list)
+            for p in pkts:
+                flags = p['tcp_flags'] or ''
+                # 重传检测（纯 ACK 不算）
+                if p['tcp_seq'] is not None and (len(flags) > 1 or flags == 'S'):
+                    seq_key = (p['src_ip'], p['src_port'], p['dst_ip'], p['dst_port'], p['tcp_seq'])
+                    seen_seq[seq_key].append(p)
+                    if len(seen_seq[seq_key]) > 1:
+                        p['is_retransmission'] = True
+                # 重复 ACK 检测
+                if flags == 'A' and p['tcp_ack'] is not None:
+                    ack_key = (p['src_ip'], p['src_port'], p['dst_ip'], p['dst_port'], p['tcp_ack'])
+                    seen_ack[ack_key].append(p)
+                    if len(seen_ack[ack_key]) >= 3:
+                        for pp in seen_ack[ack_key]:
+                            pp['is_dup_ack'] = True
+
+    # ---------- 各维度分析 ----------
+    def _analyze_file_info(self):
+        total = len(self.packets)
+        size = os.path.getsize(self.file_path)
+        times = [p['time'] for p in self.pkt_infos]
+        start = datetime.fromtimestamp(min(times)).strftime('%Y-%m-%d %H:%M:%S') if times else 'N/A'
+        end = datetime.fromtimestamp(max(times)).strftime('%Y-%m-%d %H:%M:%S') if times else 'N/A'
+        duration = max(times) - min(times) if times else 0
+        avg_len = sum(len(p) for p in self.packets) / total if total else 0
+        return {
+            'file_name': os.path.basename(self.file_path),
+            'file_path': self.file_path,
+            'file_size_mb': round(size / 1024 / 1024, 2),
+            'packet_count': total,
+            'start_time': start,
+            'end_time': end,
+            'duration_sec': round(duration, 2),
+            'avg_packet_len': round(avg_len, 2),
+        }
+
+    def _analyze_protocol(self):
+        cnt = Counter(p['proto'] for p in self.pkt_infos)
+        total = len(self.pkt_infos)
+        result = []
+        for proto, num in cnt.most_common():
+            result.append({'protocol': proto, 'count': num, 'percent': round(num / total * 100, 2) if total else 0})
+        return result
+
+    def _analyze_traffic_timeline(self):
+        if not self.pkt_infos:
+            return {'timeline': [], 'peak': None, 'duration': 0}
+        times = [p['time'] for p in self.pkt_infos]
+        start = min(times)
+        buckets = defaultdict(int)
+        for t in times:
+            buckets[int((t - start) / 10)] += 1
+        timeline = [{'time_sec': k * 10, 'count': v} for k, v in sorted(buckets.items())]
+        peak = max(timeline, key=lambda x: x['count']) if timeline else None
+        return {
+            'timeline': timeline,
+            'peak': peak,
+            'duration': round(max(times) - start, 2) if len(times) > 1 else 0,
+        }
+
+    def _analyze_tcp_handshake(self):
+        tcp_packets = [p for p in self.pkt_infos if p['proto'] in ('TCP', 'HTTP', 'TLS') and p['tcp_flags']]
+        handshakes = []
+        half_opens = []
+        refused = []
+        resets = []
+
+        # 索引所有 SYN
+        syns = {}
+        for p in tcp_packets:
+            flags = p['tcp_flags']
+            if 'S' in flags and 'A' not in flags:
+                key = (p['src_ip'], p['src_port'], p['dst_ip'], p['dst_port'])
+                syns[key] = p
+
+        for syn_key, syn_pkt in syns.items():
+            client_ip, client_port, server_ip, server_port = syn_key
+            syn_ack_key = (server_ip, server_port, client_ip, client_port)
+            syn_ack_pkt = None
+            ack_pkt = None
+
+            # 找 SYN+ACK
+            for p in tcp_packets:
+                if (p['src_ip'], p['src_port'], p['dst_ip'], p['dst_port']) == syn_ack_key:
+                    flags = p['tcp_flags']
+                    if 'S' in flags and 'A' in flags:
+                        if p['tcp_ack'] == syn_pkt['tcp_seq'] + 1:
+                            syn_ack_pkt = p
+                            break
+
+            if syn_ack_pkt:
+                # 找最终 ACK
+                ack_key = (client_ip, client_port, server_ip, server_port)
+                for p in tcp_packets:
+                    if (p['src_ip'], p['src_port'], p['dst_ip'], p['dst_port']) == ack_key:
+                        flags = p['tcp_flags']
+                        if 'A' in flags and 'S' not in flags:
+                            if p['tcp_ack'] == syn_ack_pkt['tcp_seq'] + 1 and p['time'] > syn_ack_pkt['time']:
+                                ack_pkt = p
+                                break
+
+                matched = self._ip_match(client_ip) or self._ip_match(server_ip)
+                if ack_pkt:
+                    handshakes.append({
+                        'client': client_ip, 'server': server_ip,
+                        'client_port': client_port, 'server_port': server_port,
+                        'syn_time': syn_pkt['time'],
+                        'syn_ack_time': syn_ack_pkt['time'],
+                        'ack_time': ack_pkt['time'],
+                        'latency_syn_to_synack': round(syn_ack_pkt['time'] - syn_pkt['time'], 6),
+                        'latency_total': round(ack_pkt['time'] - syn_pkt['time'], 6),
+                        'matched': matched,
+                    })
+                else:
+                    half_opens.append({
+                        'client': client_ip, 'server': server_ip,
+                        'client_port': client_port, 'server_port': server_port,
+                        'syn_time': syn_pkt['time'],
+                        'note': '收到 SYN+ACK，但未捕获到最终 ACK（可能丢包或握手未完成）',
+                        'matched': matched,
+                    })
+            else:
+                # 检查 RST
+                rst_found = False
+                matched = self._ip_match(client_ip) or self._ip_match(server_ip)
+                for p in tcp_packets:
+                    if ((p['src_ip'], p['src_port'], p['dst_ip'], p['dst_port']) == syn_ack_key or
+                        (p['src_ip'], p['src_port'], p['dst_ip'], p['dst_port']) == syn_key):
+                        if 'R' in p['tcp_flags']:
+                            refused.append({
+                                'client': client_ip, 'server': server_ip,
+                                'client_port': client_port, 'server_port': server_port,
+                                'rst_time': p['time'],
+                                'note': '连接被 RST 重置（端口未开放或防火墙拒绝）',
+                                'matched': matched,
+                            })
+                            rst_found = True
+                            break
+                if not rst_found:
+                    half_opens.append({
+                        'client': client_ip, 'server': server_ip,
+                        'client_port': client_port, 'server_port': server_port,
+                        'syn_time': syn_pkt['time'],
+                        'note': '仅发出 SYN，未收到 SYN+ACK（目标不可达、超时或被过滤）',
+                        'matched': matched,
+                    })
+
+        for p in tcp_packets:
+            if 'R' in p['tcp_flags']:
+                resets.append({
+                    'time': p['time'],
+                    'src': p['src_ip'], 'dst': p['dst_ip'],
+                    'src_port': p['src_port'], 'dst_port': p['dst_port'],
+                    'matched': self._ip_match(p['src_ip']) or self._ip_match(p['dst_ip']),
+                })
+
+        return {
+            'handshakes': handshakes,
+            'half_opens': half_opens,
+            'refused': refused,
+            'resets': resets,
+            'total_syns': len(syns),
+            'successful_handshakes': len(handshakes),
+        }
+
+    def _analyze_tls(self):
+        tls_packets = [p for p in self.pkt_infos if p['proto'] == 'TLS']
+        if not tls_packets:
+            return None
+
+        result = {
+            'total_tls_packets': len(tls_packets),
+            'client_hellos': [],
+            'server_hellos': [],
+            'certificates': [],
+            'alerts': [],
+            'weak_versions': [],
+            'sni_list': [],
+        }
+
+        for p in tls_packets:
+            tls_info = p.get('tls_info')
+            if not tls_info:
+                continue
+            t = tls_info['type']
+            matched = self._ip_match(p['src_ip']) or self._ip_match(p['dst_ip'])
+            if t == 'ClientHello':
+                result['client_hellos'].append({
+                    'time': p['time'], 'src': p['src_ip'], 'dst': p['dst_ip'],
+                    'sni': tls_info.get('sni', []),
+                    'version': tls_info.get('version', 'Unknown'),
+                    'matched': matched,
+                })
+                result['sni_list'].extend(tls_info.get('sni', []))
+                ver = str(tls_info.get('version', ''))
+                if 'SSL' in ver or 'TLS 1.0' in ver or 'TLS 1.1' in ver:
+                    result['weak_versions'].append({'src': p['src_ip'], 'version': ver, 'matched': matched})
+            elif t == 'ServerHello':
+                result['server_hellos'].append({
+                    'time': p['time'], 'src': p['src_ip'], 'dst': p['dst_ip'],
+                    'version': tls_info.get('version', 'Unknown'),
+                    'cipher': tls_info.get('cipher', 'Unknown'),
+                    'matched': matched,
+                })
+                ver = str(tls_info.get('version', ''))
+                if 'SSL' in ver or 'TLS 1.0' in ver or 'TLS 1.1' in ver:
+                    result['weak_versions'].append({'src': p['src_ip'], 'version': ver, 'matched': matched})
+            elif t == 'Certificate':
+                result['certificates'].append({
+                    'time': p['time'], 'src': p['src_ip'],
+                    'cert_count': tls_info.get('cert_count', 0),
+                    'matched': matched,
+                })
+
+        # TLS Alert 扫描（基于原始 scapy 包）
+        if TLS_AVAILABLE:
+            for idx, p in enumerate(self.packets):
+                if p.haslayer(TLS):
+                    tls = p[TLS]
+                    if hasattr(tls, 'type') and str(tls.type) == 'alert':
+                        info = self.pkt_infos[idx]
+                        result['alerts'].append({
+                            'time': info['time'], 'src': info['src_ip'], 'dst': info['dst_ip'],
+                            'src_port': info['src_port'], 'dst_port': info['dst_port'],
+                            'matched': self._ip_match(info['src_ip']) or self._ip_match(info['dst_ip']),
+                        })
+
+        return result
+
+    def _analyze_errors(self):
+        errors = []
+
+        def mkerr(level, category, detail, time_val, src_ip=None, dst_ip=None):
+            matched = self._error_match(category, detail)
+            if src_ip or dst_ip:
+                matched = matched or self._ip_match(src_ip or '') or self._ip_match(dst_ip or '')
+            return {'level': level, 'category': category, 'detail': detail, 'time': time_val, 'matched': matched}
+
+        # TCP RST
+        for p in self.pkt_infos:
+            if p['tcp_flags'] and 'R' in p['tcp_flags']:
+                errors.append(mkerr('高', 'TCP 连接重置',
+                    f"{p['src_ip']}:{p['src_port']} -> {p['dst_ip']}:{p['dst_port']} 发送 RST，连接被强制终止",
+                    p['time'], p['src_ip'], p['dst_ip']))
+
+        # 重传
+        for p in self.pkt_infos:
+            if p.get('is_retransmission'):
+                errors.append(mkerr('中', 'TCP 重传',
+                    f"{p['src_ip']}:{p['src_port']} -> {p['dst_ip']}:{p['dst_port']} Seq={p['tcp_seq']} 疑似重传",
+                    p['time'], p['src_ip'], p['dst_ip']))
+
+        # 重复 ACK
+        for p in self.pkt_infos:
+            if p.get('is_dup_ack'):
+                errors.append(mkerr('中', 'TCP 重复 ACK',
+                    f"{p['src_ip']}:{p['src_port']} -> {p['dst_ip']}:{p['dst_port']} Ack={p['tcp_ack']} 重复确认",
+                    p['time'], p['src_ip'], p['dst_ip']))
+
+        # 零窗口
+        for p in self.pkt_infos:
+            if p.get('tcp_window') == 0 and p['tcp_flags'] and 'A' in p['tcp_flags']:
+                errors.append(mkerr('中', 'TCP 零窗口',
+                    f"{p['src_ip']}:{p['src_port']} Advertised Window=0，接收缓冲区已满",
+                    p['time'], p['src_ip'], p['dst_ip']))
+
+        # ICMP 错误
+        icmp_map = {
+            3: {0: '网络不可达', 1: '主机不可达', 2: '协议不可达', 3: '端口不可达'},
+            11: {0: '传输中 TTL 耗尽', 1: '分片重组 TTL 耗尽'},
+            12: {0: 'IP 参数错误'},
+        }
+        for p in self.pkt_infos:
+            if p['icmp_type'] is not None:
+                desc = icmp_map.get(p['icmp_type'], {}).get(p['icmp_code'], f"ICMP Type={p['icmp_type']} Code={p['icmp_code']}")
+                errors.append(mkerr('高' if p['icmp_type'] == 3 else '中', 'ICMP 异常',
+                    f"{p['src_ip']} -> {p['dst_ip']} {desc}", p['time'], p['src_ip'], p['dst_ip']))
+
+        # HTTP 错误
+        for p in self.pkt_infos:
+            if p.get('http_response'):
+                status = p['http_response'].get('status', '')
+                try:
+                    s = int(status)
+                    if s >= 500:
+                        errors.append(mkerr('高', 'HTTP 服务器错误', f"{p['src_ip']} 返回 HTTP {status}", p['time'], p['src_ip'], p['dst_ip']))
+                    elif s >= 400:
+                        errors.append(mkerr('中', 'HTTP 客户端错误', f"{p['src_ip']} 返回 HTTP {status}", p['time'], p['src_ip'], p['dst_ip']))
+                except ValueError:
+                    pass
+
+        # DNS 错误
+        dns_err = {2: 'SERVFAIL', 3: 'NXDOMAIN', 5: 'REFUSED'}
+        for p in self.pkt_infos:
+            if p.get('dns_rcode') in dns_err:
+                errors.append(mkerr('中', 'DNS 解析异常',
+                    f"查询 {p.get('dns_qry', 'Unknown')} 返回 {dns_err[p['dns_rcode']]} (rcode={p['dns_rcode']})",
+                    p['time'], p['src_ip'], p['dst_ip']))
+
+        # TLS Alert
+        if self._tls_cache:
+            for alert in self._tls_cache.get('alerts', []):
+                errors.append(mkerr('高', 'TLS 告警',
+                    f"{alert['src']}:{alert['src_port']} -> {alert['dst']}:{alert['dst_port']} 触发 TLS Alert（握手失败或证书错误）",
+                    alert['time'], alert['src'], alert['dst']))
+
+        # 半开连接
+        if self._tcp_handshake_cache:
+            for ho in self._tcp_handshake_cache.get('half_opens', []):
+                errors.append(mkerr('中', 'TCP 半开连接',
+                    f"{ho['client']}:{ho['client_port']} -> {ho['server']}:{ho['server_port']} {ho['note']}",
+                    ho['syn_time'], ho['client'], ho['server']))
+
+        errors.sort(key=lambda x: x['time'])
+        if not errors:
+            errors.append({'level': '低', 'category': '无显著异常', 'detail': '基于当前规则未检测到明显错误流量', 'time': 0, 'matched': False})
+        return errors
+
+    def _analyze_ip_communication(self):
+        src_ips = Counter()
+        dst_ips = Counter()
+        ip_pairs = Counter()
+        mac_set = set()
+        ip_bytes = Counter()
+        for p in self.pkt_infos:
+            if p['src_ip']:
+                src_ips[p['src_ip']] += 1
+                ip_bytes[p['src_ip']] += p['len']
+            if p['dst_ip']:
+                dst_ips[p['dst_ip']] += 1
+                ip_bytes[p['dst_ip']] += p['len']
+            if p['src_ip'] and p['dst_ip']:
+                ip_pairs[f"{p['src_ip']} -> {p['dst_ip']}"] += 1
+        return {
+            'src_top10': src_ips.most_common(10),
+            'dst_top10': dst_ips.most_common(10),
+            'pair_top10': ip_pairs.most_common(10),
+            'unique_ips': len(set(list(src_ips.keys()) + list(dst_ips.keys()))),
+            'ip_bytes': ip_bytes.most_common(10),
+        }
+
+    def _analyze_port_session(self):
+        src_ports = Counter()
+        dst_ports = Counter()
+        tcp_sessions = set()
+        udp_sessions = set()
+        service_map = {
+            22: 'SSH', 23: 'Telnet', 53: 'DNS', 80: 'HTTP', 110: 'POP3',
+            143: 'IMAP', 443: 'HTTPS', 445: 'SMB', 465: 'SMTPS', 587: 'SMTP',
+            993: 'IMAPS', 995: 'POP3S', 3389: 'RDP', 8080: 'HTTP-Proxy', 8443: 'HTTPS-Alt'
+        }
+        services = Counter()
+
+        for p in self.pkt_infos:
+            if p['proto'] in ('TCP', 'HTTP', 'TLS'):
+                sp, dp = p['src_port'], p['dst_port']
+                src_ports[sp] += 1
+                dst_ports[dp] += 1
+                if p['src_ip'] and p['dst_ip']:
+                    sess = tuple(sorted([(p['src_ip'], sp), (p['dst_ip'], dp)]))
+                    tcp_sessions.add(sess)
+                    for port in (dp, sp):
+                        if port in service_map:
+                            services[service_map[port]] += 1
+            elif p['proto'] == 'UDP':
+                sp, dp = p['src_port'], p['dst_port']
+                src_ports[sp] += 1
+                dst_ports[dp] += 1
+                if p['src_ip'] and p['dst_ip']:
+                    sess = tuple(sorted([(p['src_ip'], sp), (p['dst_ip'], dp)]))
+                    udp_sessions.add(sess)
+                    for port in (dp, sp):
+                        if port in service_map:
+                            services[service_map[port]] += 1
+
+        return {
+            'src_ports_top10': src_ports.most_common(10),
+            'dst_ports_top10': dst_ports.most_common(10),
+            'tcp_sessions': len(tcp_sessions),
+            'udp_sessions': len(udp_sessions),
+            'services': services.most_common(),
+        }
+
+    def _generate_conclusion(self, stats):
+        fi = stats['file_info']
+        proto = stats['protocol']
+        tcp_hs = stats['tcp_handshake']
+        tls = stats['tls_analysis']
+        errs = stats['errors']
+        ipcomm = stats['ip_comm']
+        port = stats['port_session']
+        timeline = stats['traffic_timeline']
+
+        lines = []
+        lines.append("=" * 60)
+        lines.append("📊 Wireshark 深度抓包分析结论报告")
+        lines.append("=" * 60)
+        lines.append("")
+
+        lines.append(f"【文件信息】")
+        lines.append(f"  文件名称：{fi['file_name']}")
+        lines.append(f"  文件大小：{fi['file_size_mb']} MB")
+        lines.append(f"  数据包数：{fi['packet_count']} 个")
+        lines.append(f"  时间跨度：{fi['start_time']} ~ {fi['end_time']}（持续 {fi['duration_sec']} 秒）")
+        lines.append("")
+
+        lines.append(f"【协议分布】")
+        if proto:
+            top3 = proto[:3]
+            lines.append(f"  主要协议：" + "、".join([f"{p['protocol']}({p['percent']}%)" for p in top3]))
+        lines.append("")
+
+        lines.append(f"【TCP 连接分析】")
+        lines.append(f"  SYN 总数：{tcp_hs['total_syns']} 个")
+        lines.append(f"  成功三次握手：{tcp_hs['successful_handshakes']} 个")
+        if tcp_hs['half_opens']:
+            lines.append(f"  ⚠️ 半开/异常连接：{len(tcp_hs['half_opens'])} 个（可能丢包、超时或扫描）")
+        if tcp_hs['refused']:
+            lines.append(f"  ⚠️ RST 拒绝连接：{len(tcp_hs['refused'])} 个（端口未开放或防火墙拦截）")
+        if tcp_hs['resets']:
+            lines.append(f"  ⚠️ 总 RST 包：{len(tcp_hs['resets'])} 个")
+        lines.append("")
+
+        lines.append(f"【TLS/SSL 分析】")
+        if tls:
+            lines.append(f"  TLS 包总数：{tls['total_tls_packets']} 个")
+            lines.append(f"  ClientHello：{len(tls['client_hellos'])} 个")
+            lines.append(f"  ServerHello：{len(tls['server_hellos'])} 个")
+            if tls['sni_list']:
+                unique_sni = list(dict.fromkeys(tls['sni_list']))[:5]
+                lines.append(f"  SNI 域名：{', '.join(unique_sni)}")
+            if tls['weak_versions']:
+                lines.append(f"  ⚠️ 发现弱 TLS/SSL 版本通信：{len(tls['weak_versions'])} 次")
+            if tls['alerts']:
+                lines.append(f"  ⚠️ TLS Alert：{len(tls['alerts'])} 次（证书或握手异常）")
+        else:
+            lines.append(f"  未检测到 TLS 流量")
+        lines.append("")
+
+        lines.append(f"【错误与风险】")
+        high = [e for e in errs if e['level'] == '高']
+        mid = [e for e in errs if e['level'] == '中']
+        if high:
+            lines.append(f"  高风险项：{len(high)} 个")
+            for e in high[:5]:
+                lines.append(f"    - [{e['category']}] {e['detail']}")
+            if len(high) > 5:
+                lines.append(f"    ... 等共 {len(high)} 项")
+        if mid:
+            lines.append(f"  中风险项：{len(mid)} 个")
+        if not high and not mid:
+            lines.append(f"  ✅ 未发现显著异常")
+        lines.append("")
+
+        lines.append(f"【通信概况】")
+        lines.append(f"  独立 IP 数：{ipcomm['unique_ips']} 个")
+        lines.append(f"  TCP 会话数：{port['tcp_sessions']} 个")
+        lines.append(f"  UDP 会话数：{port['udp_sessions']} 个")
+        if timeline['peak']:
+            lines.append(f"  流量峰值：{timeline['peak']['count']} 包/10秒")
+        lines.append("")
+
+        # 需求匹配汇总
+        cfg_ips = self.config.get('target_ips', [])
+        cfg_focus = self.config.get('focus_errors', [])
+        cfg_question = self.config.get('question', '')
+        matched_errs = [e for e in errs if e.get('matched')]
+        matched_hs = [h for h in tcp_hs.get('handshakes', []) if h.get('matched')]
+        matched_ho = [h for h in tcp_hs.get('half_opens', []) if h.get('matched')]
+        matched_rst = [r for r in tcp_hs.get('resets', []) if r.get('matched')]
+
+        lines.append(f"【需求匹配结果】")
+        if cfg_ips:
+            lines.append(f"  重点 IP：{', '.join(cfg_ips)}")
+        if cfg_focus:
+            lines.append(f"  关注错误：{', '.join(cfg_focus)}")
+        if matched_errs or matched_hs or matched_ho or matched_rst:
+            lines.append(f"  ⭐ 共发现 {len(matched_errs)} 项匹配错误，{len(matched_hs)} 个匹配握手，{len(matched_ho)} 个匹配半开连接，{len(matched_rst)} 个匹配 RST")
+            if matched_errs:
+                lines.append(f"  关键异常：")
+                for e in matched_errs[:5]:
+                    lines.append(f"    - [{e['level']}] {e['category']}：{e['detail']}")
+        else:
+            lines.append(f"  未在抓包中发现与配置需求强匹配的内容")
+        lines.append("")
+
+        lines.append(f"【综合结论】")
+        if high:
+            lines.append(f"  本次抓包存在高风险问题，建议立即排查。重点关注：")
+            cats = list(dict.fromkeys([e['category'] for e in high]))
+            for c in cats[:3]:
+                lines.append(f"    · {c}")
+        elif mid:
+            lines.append(f"  本次抓包发现部分异常，建议结合业务确认是否为预期行为。")
+        else:
+            lines.append(f"  本次抓包未发现明显异常，协议分布和连接行为正常。")
+
+        if cfg_question:
+            lines.append("")
+            lines.append(f"【针对您的问题】")
+            lines.append(f"  问题：{cfg_question}")
+            # 基于问题类型给出简要指引
+            if '中断' in cfg_question or '断开' in cfg_question or 'reset' in cfg_question.lower():
+                lines.append(f"  线索：重点排查 RST 包和半开连接。若 RST 集中在特定 IP，通常是防火墙或应用层主动断开；若为半开连接，可能是网络丢包或目标不可达。")
+            elif '慢' in cfg_question or '延迟' in cfg_question or '卡顿' in cfg_question:
+                lines.append(f"  线索：关注三次握手延迟和 TCP 重传/重复 ACK。握手延迟高通常是网络链路或服务器响应慢；重传多则说明存在丢包。")
+            elif '证书' in cfg_question or 'TLS' in cfg_question or 'SSL' in cfg_question:
+                lines.append(f"  线索：检查 TLS Alert、弱版本和证书链完整性。TLS Alert 通常意味着客户端与服务器 TLS 配置不兼容或证书已过期。")
+            elif '失败' in cfg_question or '不通' in cfg_question:
+                lines.append(f"  线索：综合查看 ICMP 不可达、TCP RST、SYN 无响应和 HTTP 4xx/5xx。这些指标能定位是网络层、传输层还是应用层问题。")
+            else:
+                lines.append(f"  建议：结合上方的需求匹配结果和错误列表，逐项排查与目标 IP 相关的异常。")
+
+        lines.append("")
+        lines.append("=" * 60)
+        lines.append("报告生成时间：" + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+
+
+# ===================== GUI =====================
+class _BaseRoot(tk.Tk if not DND_AVAILABLE else TkinterDnD.Tk):
+    pass
+
+
+class WiresharkAnalyzerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Wireshark 深度抓包分析工具")
+        self.root.geometry("1200x800")
+        self.root.minsize(1000, 700)
+        self.root.configure(bg=COLORS['bg'])
+        self.analyzer = None
+        self.current_step = 0
+        self.step_frames = []
+        self.stats = None
+        self.analysis_config = {'target_ips': [], 'focus_errors': [], 'question': ''}
+        self.steps = [
+            "① 文件概览",
+            "② 协议统计",
+            "③ TCP 连接分析",
+            "④ TLS/证书分析",
+            "⑤ 错误与异常",
+            "⑥ 通信详情",
+            "⑦ 综合结论"
+        ]
+        self._setup_styles()
+        self._try_set_icon()
+        if not DND_AVAILABLE:
+            self._setup_windows_drop()
+        self._build_ui()
+        self._show_welcome()
+
+    def _setup_styles(self):
+        style = ttk.Style(self.root)
+        style.theme_use('clam')
+        style.configure('.', background=COLORS['bg'], foreground=COLORS['text'], font=("微软雅黑", 10))
+        style.configure('TFrame', background=COLORS['bg'])
+        style.configure('TLabel', background=COLORS['bg'], foreground=COLORS['text'])
+        style.configure('TButton', background=COLORS['primary'], foreground='#ffffff', font=("微软雅黑", 10), padding=6)
+        style.map('TButton',
+                  background=[('active', '#0277bd'), ('pressed', '#01579b')],
+                  foreground=[('active', '#ffffff')])
+        style.configure('TNotebook', background=COLORS['bg'], tabmargins=[2, 5, 2, 0])
+        style.configure('TNotebook.Tab', font=("微软雅黑", 10), padding=[10, 4])
+        style.map('TNotebook.Tab',
+                  background=[('selected', COLORS['card']), ('active', COLORS['primary_light'])],
+                  foreground=[('selected', COLORS['primary']), ('active', COLORS['text'])])
+        style.configure('TLabelframe', background=COLORS['card'], foreground=COLORS['text_secondary'])
+        style.configure('TLabelframe.Label', background=COLORS['bg'], foreground=COLORS['text_secondary'])
+        style.configure('Treeview', background=COLORS['card'], foreground=COLORS['text'],
+                        fieldbackground=COLORS['card'], rowheight=26)
+        style.configure('Treeview.Heading', background=COLORS['primary_light'], foreground=COLORS['primary'],
+                        font=("微软雅黑", 10, "bold"))
+        style.map('Treeview', background=[('selected', '#e1f5fe')], foreground=[('selected', COLORS['primary'])])
+        style.configure('Horizontal.TProgressbar', background=COLORS['primary'], troughcolor=COLORS['primary_light'])
+
+    def _try_set_icon(self):
+        ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wireshark.ico")
+        if os.path.exists(ico_path):
+            try:
+                self.root.iconbitmap(ico_path)
+            except Exception:
+                pass
+
+    def _setup_windows_drop(self):
+        """Windows 原生 WM_DROPFILES 拖拽支持（无需 tkinterdnd2）"""
+        if sys.platform != 'win32':
+            return
+        try:
+            import ctypes
+            from ctypes import WINFUNCTYPE, c_void_p, c_long, c_int, c_uint
+
+            WM_DROPFILES = 0x0233
+            GWL_WNDPROC = -4
+
+            user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+
+            try:
+                GetWindowLongPtr = user32.GetWindowLongPtrW
+                SetWindowLongPtr = user32.SetWindowLongPtrW
+            except AttributeError:
+                GetWindowLongPtr = user32.GetWindowLongW
+                SetWindowLongPtr = user32.SetWindowLongW
+
+            GetWindowLongPtr.argtypes = [c_void_p, c_int]
+            GetWindowLongPtr.restype = c_void_p
+            SetWindowLongPtr.argtypes = [c_void_p, c_int, c_void_p]
+            SetWindowLongPtr.restype = c_void_p
+            user32.CallWindowProcW.argtypes = [c_void_p, c_void_p, c_uint, c_void_p, c_void_p]
+            user32.CallWindowProcW.restype = c_long
+            shell32.DragAcceptFiles.argtypes = [c_void_p, c_int]
+            shell32.DragQueryFileW.argtypes = [c_void_p, c_uint, c_void_p, c_uint]
+            shell32.DragQueryFileW.restype = c_uint
+            shell32.DragFinish.argtypes = [c_void_p]
+
+            self._hwnd = ctypes.c_void_p(user32.GetParent(self.root.winfo_id()))
+            self._old_wndproc = GetWindowLongPtr(self._hwnd, GWL_WNDPROC)
+
+            @WINFUNCTYPE(c_long, c_void_p, c_uint, c_void_p, c_void_p)
+            def new_wndproc(hwnd, msg, wparam, lparam):
+                if msg == WM_DROPFILES:
+                    try:
+                        hdrop = ctypes.c_void_p(wparam)
+                        count = shell32.DragQueryFileW(hdrop, 0xFFFFFFFF, None, 0)
+                        files = []
+                        for i in range(count):
+                            buf = ctypes.create_unicode_buffer(1024)
+                            shell32.DragQueryFileW(hdrop, i, buf, 1024)
+                            files.append(buf.value)
+                        shell32.DragFinish(hdrop)
+                        if files:
+                            self.root.after(10, lambda fs=files: self._handle_dropped_files(fs))
+                    except Exception as e:
+                        print("Windows drop error:", e)
+                    return 0
+                return user32.CallWindowProcW(self._old_wndproc, hwnd, msg, wparam, lparam)
+
+            self._new_wndproc = new_wndproc
+            SetWindowLongPtr(self._hwnd, GWL_WNDPROC, ctypes.cast(new_wndproc, ctypes.c_void_p))
+            shell32.DragAcceptFiles(self._hwnd, 1)
+            self._windows_drop_enabled = True
+        except Exception as e:
+            print("Windows native drop setup failed:", e)
+            self._windows_drop_enabled = False
+
+    def _handle_dropped_files(self, files):
+        valid_exts = ('.pcap', '.pcapng', '.cap', '.dmp')
+        target = None
+        for f in files:
+            if os.path.isfile(f) and f.lower().endswith(valid_exts):
+                target = f
+                break
+        if target is None:
+            for f in files:
+                if os.path.isfile(f):
+                    target = f
+                    break
+        if target:
+            if not SCAPY_AVAILABLE:
+                messagebox.showerror("缺少依赖", "未安装 scapy，请执行：pip install scapy")
+                return
+            self._start_analysis(target)
+        else:
+            messagebox.showwarning("文件无效", "未找到有效的抓包文件。")
+
+    def _create_shark_logo(self, parent, size=48):
+        c = tk.Canvas(parent, width=size, height=size, bg=COLORS['bg'], highlightthickness=0)
+        m = size / 64.0
+        c.create_oval(2*m, 2*m, 62*m, 62*m, fill=COLORS['primary_light'], outline=COLORS['primary'], width=2)
+        body = [(12, 38), (22, 28), (38, 30), (48, 22), (54, 28), (44, 36), (48, 42), (32, 40), (22, 46)]
+        body_scaled = [(x*m, y*m) for x, y in body]
+        c.create_polygon(body_scaled, fill="#ffffff", outline=COLORS['primary'], width=1.5)
+        c.create_oval(46*m, 24*m, 50*m, 28*m, fill=COLORS['primary'], outline=COLORS['primary'])
+        return c
+
+    def _show_config_dialog(self):
+        top = tk.Toplevel(self.root)
+        top.title("分析需求配置")
+        top.geometry("500x380")
+        top.configure(bg=COLORS['card'])
+        top.transient(self.root)
+        top.grab_set()
+
+        tk.Label(top, text="配置分析需求", font=("微软雅黑", 14, "bold"), bg=COLORS['card'], fg=COLORS['primary']).pack(pady=(15, 10))
+
+        frame = tk.Frame(top, bg=COLORS['card'])
+        frame.pack(fill=tk.X, padx=20, pady=5)
+
+        # 目标 IP
+        tk.Label(frame, text="重点分析 IP（多个用逗号分隔）：", bg=COLORS['card'], fg=COLORS['text'], font=("微软雅黑", 10)).pack(anchor=tk.W)
+        entry_ips = tk.Entry(frame, font=("Consolas", 10))
+        entry_ips.pack(fill=tk.X, pady=(0, 10))
+        if self.analysis_config.get('target_ips'):
+            entry_ips.insert(0, ', '.join(self.analysis_config['target_ips']))
+
+        # 关注错误
+        tk.Label(frame, text="关注错误类型（多个用逗号分隔，如 RST,重传,TLS）：", bg=COLORS['card'], fg=COLORS['text'], font=("微软雅黑", 10)).pack(anchor=tk.W)
+        entry_err = tk.Entry(frame, font=("Consolas", 10))
+        entry_err.pack(fill=tk.X, pady=(0, 10))
+        if self.analysis_config.get('focus_errors'):
+            entry_err.insert(0, ', '.join(self.analysis_config['focus_errors']))
+
+        # 具体问题
+        tk.Label(frame, text="具体问题描述（用于结论针对性分析）：", bg=COLORS['card'], fg=COLORS['text'], font=("微软雅黑", 10)).pack(anchor=tk.W)
+        entry_q = tk.Text(frame, height=4, font=("微软雅黑", 10))
+        entry_q.pack(fill=tk.X, pady=(0, 10))
+        if self.analysis_config.get('question'):
+            entry_q.insert(tk.END, self.analysis_config['question'])
+
+        def save():
+            ips = [x.strip() for x in entry_ips.get().split(',') if x.strip()]
+            errs = [x.strip() for x in entry_err.get().split(',') if x.strip()]
+            q = entry_q.get("1.0", tk.END).strip()
+            self.analysis_config = {'target_ips': ips, 'focus_errors': errs, 'question': q}
+            top.destroy()
+
+        btn_frame = tk.Frame(top, bg=COLORS['card'])
+        btn_frame.pack(pady=10)
+        tk.Button(btn_frame, text="保存", command=save, bg=COLORS['primary'], fg="#ffffff",
+                  font=("微软雅黑", 10), bd=0, padx=20, pady=5, cursor="hand2").pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="取消", command=top.destroy, bg=COLORS['primary_light'], fg=COLORS['primary'],
+                  font=("微软雅黑", 10), bd=0, padx=20, pady=5, cursor="hand2").pack(side=tk.LEFT, padx=5)
+
+    def _build_ui(self):
+        # 顶部工具栏
+        toolbar = tk.Frame(self.root, bg=COLORS['bg'])
+        toolbar.pack(fill=tk.X, padx=15, pady=10)
+        left_tool = tk.Frame(toolbar, bg=COLORS['bg'])
+        left_tool.pack(side=tk.LEFT)
+        self._create_shark_logo(left_tool, size=42).pack(side=tk.LEFT, padx=(0, 10))
+        tk.Label(left_tool, text="Wireshark 深度抓包分析工具", bg=COLORS['bg'], fg=COLORS['primary'],
+                 font=("微软雅黑", 16, "bold")).pack(side=tk.LEFT)
+        btn_config = tk.Button(toolbar, text="⚙️ 分析需求", command=self._show_config_dialog,
+                               bg=COLORS['primary_light'], fg=COLORS['primary'],
+                               activebackground=COLORS['primary_hover'], activeforeground=COLORS['primary'],
+                               font=("微软雅黑", 10), bd=0, padx=12, pady=6, cursor="hand2")
+        btn_config.pack(side=tk.RIGHT, padx=5)
+        btn_reset = tk.Button(toolbar, text="🔄 重新分析", command=self._reset, bg=COLORS['primary'], fg="#ffffff",
+                              activebackground="#0277bd", activeforeground="#ffffff",
+                              font=("微软雅黑", 10), bd=0, padx=12, pady=6, cursor="hand2")
+        btn_reset.pack(side=tk.RIGHT, padx=5)
+
+        # 主内容区
+        self.main_paned = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.main_paned.pack(fill=tk.BOTH, expand=True, padx=15, pady=5)
+
+        # 左侧步骤导航
+        self.left_frame = tk.Frame(self.main_paned, width=190, bg=COLORS['card'],
+                                   highlightbackground=COLORS['border'], highlightthickness=1, bd=0)
+        self.main_paned.add(self.left_frame, weight=0)
+        self.left_frame.pack_propagate(False)
+        tk.Label(self.left_frame, text="分析步骤", bg=COLORS['card'], fg=COLORS['text'],
+                 font=("微软雅黑", 11, "bold")).pack(pady=(15, 8))
+        self.step_listbox = tk.Listbox(self.left_frame, font=("微软雅黑", 10), selectmode=tk.SINGLE,
+                                       bd=0, highlightthickness=0, bg=COLORS['card'], fg=COLORS['text'],
+                                       selectbackground=COLORS['primary_light'], selectforeground=COLORS['primary'],
+                                       activestyle="none", relief=tk.FLAT)
+        self.step_listbox.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        for s in self.steps:
+            self.step_listbox.insert(tk.END, s)
+        self.step_listbox.bind('<<ListboxSelect>>', self._on_step_select)
+
+        # 右侧内容区
+        self.right_frame = tk.Frame(self.main_paned, bg=COLORS['card'],
+                                    highlightbackground=COLORS['border'], highlightthickness=1, bd=0)
+        self.main_paned.add(self.right_frame, weight=1)
+
+        # 欢迎/文件选择界面
+        self.welcome_frame = tk.Frame(self.right_frame, bg=COLORS['card'])
+        self.welcome_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
+        drop_frame = tk.Frame(self.welcome_frame, bg=COLORS['primary_light'],
+                              highlightbackground=COLORS['primary'], highlightthickness=2, bd=0)
+        drop_frame.pack(padx=20, pady=20)
+        inner_drop = tk.Frame(drop_frame, bg=COLORS['primary_light'])
+        inner_drop.pack(padx=40, pady=40)
+        self._create_shark_logo(inner_drop, size=64).pack(pady=(0, 10))
+        self.drop_label = tk.Label(inner_drop, text="点击选择文件\n或将抓包文件拖拽到此处",
+                                   font=("微软雅黑", 13), bg=COLORS['primary_light'], fg=COLORS['primary'],
+                                   cursor="hand2")
+        self.drop_label.pack()
+        self.drop_label.bind("<Button-1>", lambda e: self._choose_file())
+        if DND_AVAILABLE:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind('<<Drop>>', self._on_drop)
+            self.drop_label.config(text="点击选择文件\n或将抓包文件拖拽到此处 ✓")
+        elif getattr(self, '_windows_drop_enabled', False):
+            self.drop_label.config(text="点击选择文件\n或将抓包文件拖拽到此处 ✓")
+
+        btn_choose = tk.Button(self.welcome_frame, text="📁 选择 pcap / pcapng 文件", command=self._choose_file,
+                               bg=COLORS['primary'], fg="#ffffff", activebackground="#0277bd",
+                               activeforeground="#ffffff", font=("微软雅黑", 11), bd=0, padx=20, pady=10, cursor="hand2")
+        btn_choose.pack(pady=15)
+        tk.Label(self.welcome_frame, text="支持 .pcap / .pcapng 格式 | 需要安装 scapy",
+                 bg=COLORS['card'], fg=COLORS['text_secondary'], font=("微软雅黑", 9)).pack()
+
+        # 分析进度条
+        self.progress_frame = tk.Frame(self.right_frame, bg=COLORS['card'])
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(self.progress_frame, variable=self.progress_var, maximum=100, length=400)
+        self.progress_bar.pack(pady=10)
+        self.progress_label = tk.Label(self.progress_frame, text="正在加载...", bg=COLORS['card'],
+                                       fg=COLORS['text_secondary'], font=("微软雅黑", 10))
+        self.progress_label.pack()
+
+        # 步骤内容容器
+        self.content_notebook = ttk.Notebook(self.right_frame)
+        self.step_tabs = []
+        for i, title in enumerate(self.steps):
+            tab = tk.Frame(self.content_notebook, bg=COLORS['card'])
+            self.content_notebook.add(tab, text=title)
+            self.step_tabs.append(tab)
+
+        # 底部导航按钮
+        self.nav_frame = tk.Frame(self.root, bg=COLORS['bg'])
+        self.nav_frame.pack(fill=tk.X, padx=15, pady=10)
+        self.btn_prev = tk.Button(self.nav_frame, text="◀ 上一步", command=self._prev_step,
+                                  bg=COLORS['primary_light'], fg=COLORS['primary'], activebackground=COLORS['primary_hover'],
+                                  activeforeground=COLORS['primary'], font=("微软雅黑", 10), bd=0, padx=15, pady=6, cursor="hand2")
+        self.btn_prev.pack(side=tk.LEFT, padx=5)
+        self.btn_next = tk.Button(self.nav_frame, text="下一步 ▶", command=self._next_step,
+                                  bg=COLORS['primary'], fg="#ffffff", activebackground="#0277bd",
+                                  activeforeground="#ffffff", font=("微软雅黑", 10), bd=0, padx=15, pady=6, cursor="hand2")
+        self.btn_next.pack(side=tk.RIGHT, padx=5)
+        self.step_info = tk.Label(self.nav_frame, text="请选择抓包文件开始分析", bg=COLORS['bg'],
+                                  fg=COLORS['text_secondary'], font=("微软雅黑", 10))
+        self.step_info.pack(side=tk.TOP, pady=2)
+
+        self._update_nav_state()
+
+    def _show_welcome(self):
+        self.welcome_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        self.progress_frame.place_forget()
+        self.content_notebook.place_forget()
+        self.step_listbox.selection_clear(0, tk.END)
+        self.step_info.config(text="请选择抓包文件开始分析")
+        self.current_step = -1
+        self._update_nav_state()
+
+    def _hide_welcome(self):
+        self.welcome_frame.place_forget()
+
+    def _show_progress(self, msg="正在分析..."):
+        self._hide_welcome()
+        self.content_notebook.place_forget()
+        self.progress_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+        self.progress_label.config(text=msg)
+        self.progress_var.set(0)
+        self.root.update_idletasks()
+
+    def _show_content(self):
+        self.progress_frame.place_forget()
+        self.welcome_frame.place_forget()
+        self.content_notebook.place(relwidth=1.0, relheight=1.0)
+        self.current_step = 0
+        self.step_listbox.selection_clear(0, tk.END)
+        self.step_listbox.selection_set(0)
+        self.step_listbox.see(0)
+        self.content_notebook.select(0)
+        self._update_nav_state()
+        self._render_step(0)
+
+    def _choose_file(self):
+        if not SCAPY_AVAILABLE:
+            messagebox.showerror("缺少依赖", "未安装 scapy，请执行：pip install scapy")
+            return
+        path = filedialog.askopenfilename(
+            title="选择抓包文件",
+            filetypes=[("抓包文件", "*.pcap *.pcapng"), ("所有文件", "*.*")]
+        )
+        if path:
+            self._start_analysis(path)
+
+    def _on_drop(self, event):
+        raw = event.data
+        files = re.findall(r'\{([^}]+)\}', raw)
+        if not files:
+            files = [raw]
+        cleaned = [f.strip().strip('"') for f in files if f.strip()]
+        self._handle_dropped_files(cleaned)
+
+    def _start_analysis(self, path):
+        self._show_progress("正在深度分析抓包数据...")
+        self.analyzer = PacketAnalyzer(path, config=self.analysis_config)
+        self.root.after(100, self._do_analysis)
+
+    def _do_analysis(self):
+        def work():
+            ok = self.analyzer.load()
+            if ok:
+                self.stats = self.analyzer.analyze()
+                self.root.after(0, self._on_analysis_done)
+            else:
+                self.root.after(0, lambda: self._on_analysis_error(self.analyzer.error_msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_analysis_done(self):
+        self._build_step_contents()
+        self._show_content()
+
+    def _on_analysis_error(self, msg):
+        self._show_welcome()
+        messagebox.showerror("分析失败", f"无法解析该文件：\n{msg}")
+
+    def _build_step_contents(self):
+        for tab in self.step_tabs:
+            for w in tab.winfo_children():
+                w.destroy()
+        s = self.stats
+        if not s:
+            return
+
+        def make_tree(parent, cols, headings, widths, data, height=12):
+            frame = tk.Frame(parent, bg=COLORS['card'])
+            frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+            tree = ttk.Treeview(frame, columns=cols, show="headings", height=height)
+            for c, h, w in zip(cols, headings, widths):
+                tree.heading(c, text=h)
+                tree.column(c, width=w, anchor=tk.CENTER)
+            tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+            vsb.pack(side=tk.RIGHT, fill=tk.Y)
+            tree.configure(yscrollcommand=vsb.set)
+            for row in data:
+                tree.insert("", tk.END, values=row if isinstance(row, (list, tuple)) else tuple(row.values()))
+            return tree
+
+        def make_label(parent, text, font=("微软雅黑", 11), fg=COLORS['text']):
+            tk.Label(parent, text=text, font=font, bg=COLORS['card'], fg=fg, justify=tk.LEFT).pack(anchor=tk.W, padx=10, pady=2)
+
+        # ========== Step 0: 文件概览 ==========
+        tab = self.step_tabs[0]
+        fi = s['file_info']
+        tl = s['traffic_timeline']
+        info_lines = (
+            f"文件名称：    {fi['file_name']}\n"
+            f"文件路径：    {fi['file_path']}\n"
+            f"文件大小：    {fi['file_size_mb']} MB\n"
+            f"数据包总数：  {fi['packet_count']} 个\n"
+            f"捕获开始：    {fi['start_time']}\n"
+            f"捕获结束：    {fi['end_time']}\n"
+            f"持续时间：    {fi['duration_sec']} 秒\n"
+            f"平均包长度：  {fi['avg_packet_len']} 字节"
+        )
+        tk.Label(tab, text=info_lines, font=("Consolas", 11), bg=COLORS['card'], fg=COLORS['text'],
+                 justify=tk.LEFT).pack(anchor=tk.W, padx=20, pady=(20, 10))
+
+        if tl['timeline']:
+            make_label(tab, "流量时间线（每10秒包数）", font=("微软雅黑", 11, "bold"))
+            make_tree(tab, ("time_sec", "count"), ("时间段(秒)", "包数"), (150, 150),
+                      [(f"{x['time_sec']}~{x['time_sec']+10}", x['count']) for x in tl['timeline']], height=8)
+            if tl['peak']:
+                make_label(tab, f"流量峰值：{tl['peak']['count']} 包/10秒", font=("微软雅黑", 10), fg=COLORS['primary'])
+
+        # ========== Step 1: 协议统计 ==========
+        tab = self.step_tabs[1]
+        make_label(tab, "协议分布", font=("微软雅黑", 12, "bold"), fg=COLORS['primary'])
+        make_tree(tab, ("protocol", "count", "percent"), ("协议", "包数", "占比(%)"), (180, 180, 180),
+                  [(x['protocol'], x['count'], x['percent']) for x in s['protocol']], height=14)
+        ps = s['port_session']
+        if ps['services']:
+            make_label(tab, "识别到的服务", font=("微软雅黑", 12, "bold"), fg=COLORS['primary'])
+            make_tree(tab, ("service", "count"), ("服务", "包数"), (200, 200),
+                      ps['services'], height=6)
+
+        # ========== Step 2: TCP 连接分析 ==========
+        tab = self.step_tabs[2]
+        th = s['tcp_handshake']
+        summary = (
+            f"SYN 总数：{th['total_syns']}    成功三次握手：{th['successful_handshakes']}    "
+            f"半开连接：{len(th['half_opens'])}    RST 拒绝：{len(th['refused'])}    总 RST：{len(th['resets'])}"
+        )
+        tk.Label(tab, text=summary, font=("微软雅黑", 11), bg=COLORS['card'], fg=COLORS['primary']).pack(pady=(10, 5))
+
+        if th['handshakes']:
+            make_label(tab, "成功的三次握手", font=("微软雅黑", 11, "bold"))
+            make_tree(tab,
+                      ("match", "client", "server", "cport", "sport", "syn_ack", "total"),
+                      ("匹配", "客户端", "服务端", "源端口", "目的端口", "SYN-ACK延迟(s)", "总延迟(s)"),
+                      (50, 120, 120, 70, 70, 100, 100),
+                      [("★" if x.get('matched') else "", x['client'], x['server'], x['client_port'], x['server_port'],
+                        x['latency_syn_to_synack'], x['latency_total']) for x in th['handshakes']], height=8)
+
+        if th['half_opens']:
+            make_label(tab, "半开/异常连接", font=("微软雅黑", 11, "bold"), fg=COLORS['warning'])
+            make_tree(tab,
+                      ("match", "client", "server", "cport", "sport", "note"),
+                      ("匹配", "客户端", "服务端", "源端口", "目的端口", "说明"),
+                      (50, 120, 120, 70, 70, 320),
+                      [("★" if x.get('matched') else "", x['client'], x['server'], x['client_port'], x['server_port'], x['note']) for x in th['half_opens']], height=6)
+
+        if th['refused']:
+            make_label(tab, "RST 拒绝的连接", font=("微软雅黑", 11, "bold"), fg=COLORS['danger'])
+            make_tree(tab,
+                      ("match", "client", "server", "cport", "sport", "note"),
+                      ("匹配", "客户端", "服务端", "源端口", "目的端口", "说明"),
+                      (50, 120, 120, 70, 70, 320),
+                      [("★" if x.get('matched') else "", x['client'], x['server'], x['client_port'], x['server_port'], x['note']) for x in th['refused']], height=5)
+
+        if th['resets']:
+            make_label(tab, "所有 RST 包", font=("微软雅黑", 11, "bold"), fg=COLORS['danger'])
+            make_tree(tab,
+                      ("match", "src", "dst", "sport", "dport"),
+                      ("匹配", "源IP", "目的IP", "源端口", "目的端口"),
+                      (50, 160, 160, 90, 90),
+                      [("★" if x.get('matched') else "", x['src'], x['dst'], x['src_port'], x['dst_port']) for x in th['resets']], height=6)
+
+        # ========== Step 3: TLS/证书分析 ==========
+        tab = self.step_tabs[3]
+        tls = s['tls_analysis']
+        if tls:
+            tk.Label(tab, text=f"TLS 包总数：{tls['total_tls_packets']}    ClientHello：{len(tls['client_hellos'])}    "
+                              f"ServerHello：{len(tls['server_hellos'])}    Certificate：{len(tls['certificates'])}",
+                     font=("微软雅黑", 11), bg=COLORS['card'], fg=COLORS['primary']).pack(pady=(10, 5))
+
+            if tls['sni_list']:
+                make_label(tab, "SNI 域名列表（去重前5）", font=("微软雅黑", 11, "bold"))
+                unique_sni = list(dict.fromkeys(tls['sni_list']))[:5]
+                for sni in unique_sni:
+                    make_label(tab, f"  · {sni}", font=("微软雅黑", 10))
+
+            if tls['client_hellos']:
+                make_label(tab, "ClientHello 详情", font=("微软雅黑", 11, "bold"))
+                make_tree(tab, ("match", "src", "dst", "version", "sni"),
+                          ("匹配", "源IP", "目的IP", "TLS版本", "SNI"),
+                          (50, 140, 140, 120, 220),
+                          [("★" if x.get('matched') else "", x['src'], x['dst'], x['version'], ', '.join(x.get('sni', [])[:3])) for x in tls['client_hellos']], height=6)
+
+            if tls['server_hellos']:
+                make_label(tab, "ServerHello 详情", font=("微软雅黑", 11, "bold"))
+                make_tree(tab, ("match", "src", "dst", "version", "cipher"),
+                          ("匹配", "源IP", "目的IP", "TLS版本", "密码套件"),
+                          (50, 140, 140, 120, 270),
+                          [("★" if x.get('matched') else "", x['src'], x['dst'], x['version'], x.get('cipher', 'Unknown')) for x in tls['server_hellos']], height=6)
+
+            if tls['weak_versions']:
+                make_label(tab, f"⚠️ 弱 TLS/SSL 版本通信：{len(tls['weak_versions'])} 次", font=("微软雅黑", 11, "bold"), fg=COLORS['warning'])
+
+            if tls['alerts']:
+                make_label(tab, f"⚠️ TLS Alert：{len(tls['alerts'])} 次", font=("微软雅黑", 11, "bold"), fg=COLORS['danger'])
+                make_tree(tab, ("match", "src", "dst", "sport", "dport"),
+                          ("匹配", "源IP", "目的IP", "源端口", "目的端口"),
+                          (50, 180, 180, 110, 110),
+                          [("★" if x.get('matched') else "", x['src'], x['dst'], x['src_port'], x['dst_port']) for x in tls['alerts']], height=5)
+        else:
+            tk.Label(tab, text="未检测到 TLS/SSL 流量", font=("微软雅黑", 13), bg=COLORS['card'],
+                     fg=COLORS['text_secondary']).pack(pady=50)
+
+        # ========== Step 4: 错误与异常 ==========
+        tab = self.step_tabs[4]
+        errs = s['errors']
+        high_cnt = len([e for e in errs if e['level'] == '高'])
+        mid_cnt = len([e for e in errs if e['level'] == '中'])
+        tk.Label(tab, text=f"高风险：{high_cnt} 项    中风险：{mid_cnt} 项    低风险/正常：{len(errs)-high_cnt-mid_cnt} 项",
+                 font=("微软雅黑", 11), bg=COLORS['card'], fg=COLORS['primary']).pack(pady=(10, 5))
+
+        frame_err = tk.Frame(tab, bg=COLORS['card'])
+        frame_err.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        tree_err = ttk.Treeview(frame_err, columns=("match", "level", "category", "detail"), show="headings", height=22)
+        tree_err.heading("match", text="匹配")
+        tree_err.heading("level", text="等级")
+        tree_err.heading("category", text="类别")
+        tree_err.heading("detail", text="详细信息")
+        tree_err.column("match", width=50, anchor=tk.CENTER)
+        tree_err.column("level", width=60, anchor=tk.CENTER)
+        tree_err.column("category", width=150, anchor=tk.CENTER)
+        tree_err.column("detail", width=650, anchor=tk.W)
+        tree_err.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb_err = ttk.Scrollbar(frame_err, orient="vertical", command=tree_err.yview)
+        vsb_err.pack(side=tk.RIGHT, fill=tk.Y)
+        tree_err.configure(yscrollcommand=vsb_err.set)
+
+        level_colors = {'高': '#e53935', '中': '#fb8c00', '低': '#43a047'}
+        for item in errs:
+            tag = f"lvl_{item['level']}"
+            if item.get('matched'):
+                tag += " matched"
+            tree_err.insert("", tk.END, values=("★" if item.get('matched') else "", item['level'], item['category'], item['detail']), tags=(tag,))
+        for lv, col in level_colors.items():
+            tree_err.tag_configure(f"lvl_{lv}", foreground=col)
+        tree_err.tag_configure("matched", background="#fff9c4")
+
+        # ========== Step 5: 通信详情 ==========
+        tab = self.step_tabs[5]
+        ip = s['ip_comm']
+        ps = s['port_session']
+        pw = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        pw.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        left = tk.LabelFrame(pw, text="Top 10 源 IP", bg=COLORS['card'], fg=COLORS['text_secondary'],
+                             font=("微软雅黑", 9), bd=1, highlightbackground=COLORS['border'], highlightthickness=1)
+        right = tk.LabelFrame(pw, text="Top 10 目的 IP", bg=COLORS['card'], fg=COLORS['text_secondary'],
+                              font=("微软雅黑", 9), bd=1, highlightbackground=COLORS['border'], highlightthickness=1)
+        pw.add(left, weight=1)
+        pw.add(right, weight=1)
+        make_tree(left, ("ip", "count"), ("IP 地址", "包数"), (160, 100), ip['src_top10'], height=10)
+        make_tree(right, ("ip", "count"), ("IP 地址", "包数"), (160, 100), ip['dst_top10'], height=10)
+
+        bottom = tk.LabelFrame(tab, text="Top 通信对 & 端口", bg=COLORS['card'], fg=COLORS['text_secondary'],
+                               font=("微软雅黑", 9), bd=1, highlightbackground=COLORS['border'], highlightthickness=1)
+        bottom.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        make_tree(bottom, ("pair", "count"), ("通信对", "包数"), (400, 100), ip['pair_top10'], height=6)
+        make_tree(bottom, ("port", "count"), ("目的端口", "包数"), (200, 200), ps['dst_ports_top10'], height=6)
+        tk.Label(tab, text=f"TCP 会话数：{ps['tcp_sessions']}    UDP 会话数：{ps['udp_sessions']}    独立 IP：{ip['unique_ips']} 个",
+                 font=("微软雅黑", 11), bg=COLORS['card'], fg=COLORS['text']).pack(pady=5)
+
+        # ========== Step 6: 综合结论 ==========
+        tab = self.step_tabs[6]
+        text = scrolledtext.ScrolledText(tab, wrap=tk.WORD, font=("微软雅黑", 11), padx=10, pady=10)
+        text.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        text.insert(tk.END, s['conclusion'])
+        text.config(state=tk.DISABLED)
+
+    def _on_step_select(self, event):
+        sel = self.step_listbox.curselection()
+        if sel:
+            idx = sel[0]
+            self.current_step = idx
+            self.content_notebook.select(idx)
+            self._update_nav_state()
+            self._render_step(idx)
+
+    def _render_step(self, idx):
+        if 0 <= idx < len(self.steps):
+            self.step_info.config(text=f"当前步骤：{self.steps[idx]}  ({idx+1}/{len(self.steps)})")
+
+    def _prev_step(self):
+        if self.current_step > 0:
+            self.current_step -= 1
+            self.step_listbox.selection_clear(0, tk.END)
+            self.step_listbox.selection_set(self.current_step)
+            self.step_listbox.see(self.current_step)
+            self.content_notebook.select(self.current_step)
+            self._update_nav_state()
+            self._render_step(self.current_step)
+
+    def _next_step(self):
+        if self.current_step < len(self.steps) - 1:
+            self.current_step += 1
+            self.step_listbox.selection_clear(0, tk.END)
+            self.step_listbox.selection_set(self.current_step)
+            self.step_listbox.see(self.current_step)
+            self.content_notebook.select(self.current_step)
+            self._update_nav_state()
+            self._render_step(self.current_step)
+
+    def _update_nav_state(self):
+        if self.current_step < 0:
+            self.btn_prev.config(state=tk.DISABLED)
+            self.btn_next.config(state=tk.DISABLED)
+            self.step_listbox.config(state=tk.DISABLED)
+            return
+        self.step_listbox.config(state=tk.NORMAL)
+        self.btn_prev.config(state=tk.NORMAL if self.current_step > 0 else tk.DISABLED)
+        self.btn_next.config(state=tk.NORMAL if self.current_step < len(self.steps) - 1 else tk.DISABLED)
+
+    def _reset(self):
+        self.stats = None
+        self.analyzer = None
+        self.current_step = -1
+        for tab in self.step_tabs:
+            for w in tab.winfo_children():
+                w.destroy()
+        self._show_welcome()
+
+
+def main():
+    root = _BaseRoot()
+    app = WiresharkAnalyzerApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
