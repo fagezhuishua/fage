@@ -1,0 +1,1504 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+文件类型转换工具 - Modern GUI Edition (customtkinter + tkinterdnd2)
+功能：
+1. 支持多种文件格式互转：文档、表格、演示、图像、音频等
+2. 现代化 GUI 界面，支持深色/浅色主题
+3. 支持拖拽上传文件/文件夹，递归扫描
+4. 支持批量转换，结果可下载
+5. 详细的错误诊断与格式支持说明
+"""
+
+import os
+import sys
+import shutil
+import threading
+import json
+import csv
+import tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import customtkinter as ctk
+from customtkinter import (
+    CTk, CTkFrame, CTkButton, CTkLabel, CTkTextbox,
+    CTkComboBox, CTkSwitch, CTkEntry, CTkProgressBar,
+    CTkScrollableFrame, CTkToplevel,
+)
+from tkinter import filedialog, messagebox
+
+# 拖拽支持
+try:
+    import tkinter
+    import tkinterdnd2.TkinterDnD
+    from tkinterdnd2 import DND_FILES
+    _dnd_attrs = [
+        '_subst_format_dnd', '_subst_format_str_dnd', '_substitute_dnd', '_dnd_bind',
+        'dnd_bind', 'drag_source_register', 'drag_source_unregister',
+        'drop_target_register', 'drop_target_unregister',
+        'platform_independent_types', 'platform_specific_types',
+        'get_dropfile_tempdir', 'set_dropfile_tempdir',
+    ]
+    for _attr in _dnd_attrs:
+        if hasattr(tkinter.BaseWidget, _attr) and not hasattr(tkinter.Tk, _attr):
+            setattr(tkinter.Tk, _attr, getattr(tkinter.BaseWidget, _attr))
+    _tkdnd_available = True
+except ImportError:
+    _tkdnd_available = False
+    DND_FILES = None
+
+# 文档处理库
+try:
+    from docx import Document
+except ImportError:
+    Document = None
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+try:
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+try:
+    from PyPDF2 import PdfReader
+except ImportError:
+    PdfReader = None
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+except ImportError:
+    canvas = None
+    letter = None
+
+try:
+    from pdf2docx import Converter
+except ImportError:
+    Converter = None
+
+try:
+    from docx2pdf import convert as docx2pdf_convert
+except ImportError:
+    docx2pdf_convert = None
+
+try:
+    import markdown
+except ImportError:
+    markdown = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        from pydub import AudioSegment
+except ImportError:
+    AudioSegment = None
+
+try:
+    import win32com.client as win32com_client
+except ImportError:
+    win32com_client = None
+
+# 全局外观设置
+ctk.set_appearance_mode("System")
+ctk.set_default_color_theme("blue")
+
+
+# ==================== 错误类型定义 ====================
+class ConversionError(Exception):
+    TYPE_UNSUPPORTED = "不支持的格式"
+    TYPE_MISSING_DEP = "缺少依赖"
+    TYPE_FILE_NOT_FOUND = "文件不存在"
+    TYPE_EMPTY_FILE = "文件为空"
+    TYPE_CORRUPTED = "文件损坏"
+    TYPE_PERMISSION = "权限不足"
+    TYPE_FAILED = "转换失败"
+
+    def __init__(self, err_type: str, detail: str):
+        super().__init__(f"[{err_type}] {detail}")
+        self.err_type = err_type
+        self.detail = detail
+
+
+# ==================== 支持的转换映射与说明 ====================
+SUPPORTED_EXTS = {
+    ".doc", ".docx", ".pdf", ".txt", ".rtf", ".odt", ".md", ".html", ".htm",
+    ".xls", ".xlsx", ".csv",
+    ".ppt", ".pptx",
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".bmp", ".svg",
+    ".wav", ".aiff", ".au",
+    ".xml", ".json",
+}
+
+CONVERSION_MAP = {
+    # 文档
+    ".doc":   [".docx", ".pdf", ".txt", ".rtf"],
+    ".docx":  [".txt", ".pdf", ".md", ".html", ".htm"],
+    ".pdf":   [".txt", ".docx"],
+    ".txt":   [".docx", ".pdf", ".csv", ".md", ".html", ".htm"],
+    ".rtf":   [".docx", ".pdf", ".txt"],
+    ".odt":   [".docx", ".pdf", ".txt"],
+    ".md":    [".html", ".htm", ".docx", ".txt", ".pdf"],
+    ".html":  [".pdf", ".txt", ".docx", ".md"],
+    ".htm":   [".pdf", ".txt", ".docx", ".md"],
+    # 表格
+    ".xls":   [".xlsx", ".csv", ".pdf", ".txt"],
+    ".xlsx":  [".csv", ".json", ".xml", ".txt", ".docx", ".html", ".htm"],
+    ".csv":   [".xlsx", ".json", ".xml", ".txt", ".docx", ".html", ".htm"],
+    # 演示
+    ".ppt":   [".pptx", ".pdf"],
+    ".pptx":  [".pdf"],
+    # 图像
+    ".jpg":   [".png", ".gif", ".tiff", ".webp", ".bmp"],
+    ".jpeg":  [".png", ".gif", ".tiff", ".webp", ".bmp"],
+    ".png":   [".jpg", ".jpeg", ".gif", ".tiff", ".webp", ".bmp"],
+    ".gif":   [".jpg", ".jpeg", ".png", ".tiff", ".webp", ".bmp"],
+    ".webp":  [".jpg", ".jpeg", ".png", ".gif", ".tiff", ".bmp"],
+    ".tiff":  [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"],
+    ".bmp":   [".jpg", ".jpeg", ".png", ".gif", ".tiff", ".webp"],
+    ".svg":   [".png", ".jpg", ".jpeg"],
+    # 音频
+    ".wav":   [".aiff", ".au", ".mp3"],
+    ".aiff":  [".wav", ".au", ".mp3"],
+    ".au":    [".wav", ".aiff", ".mp3"],
+    # 数据
+    ".xml":   [".json", ".csv"],
+    ".json":  [".csv", ".xml"],
+}
+
+FORMAT_DESCRIPTIONS = {
+    ".doc": {
+        "name": "Word 旧版 (.doc)",
+        "desc": "Microsoft Word 97-2003 格式（需 Windows + Microsoft Word）",
+        "targets": {
+            ".docx": "转为新版 Word 文档",
+            ".pdf": "转为 PDF",
+            ".txt": "提取纯文本",
+            ".rtf": "转为 RTF 格式",
+        },
+        "example": "一份旧版 Word 文档",
+    },
+    ".docx": {
+        "name": "Word 文档 (.docx)",
+        "desc": "Microsoft Word 2007+ 格式",
+        "targets": {
+            ".txt": "提取纯文本内容",
+            ".pdf": "转为 PDF（优先 docx2pdf 保留格式）",
+            ".md": "提取文本并转为 Markdown",
+            ".html": "转为 HTML 网页",
+        },
+        "example": "一份包含标题和正文的 Word 文档",
+    },
+    ".pdf": {
+        "name": "PDF 文档 (.pdf)",
+        "desc": "便携式文档格式",
+        "targets": {
+            ".txt": "提取文本内容（扫描版可能失败）",
+            ".docx": "转为 Word 文档（使用 pdf2docx）",
+        },
+        "example": "一份由 Word 导出的 PDF",
+    },
+    ".txt": {
+        "name": "纯文本 (.txt)",
+        "desc": "UTF-8 编码的纯文本文件",
+        "targets": {
+            ".docx": "转为 Word 文档",
+            ".pdf": "转为 PDF",
+            ".csv": "每行转为 CSV 的一列",
+            ".md": "包装为 Markdown",
+            ".html": "包装为 HTML",
+        },
+        "example": "一个日志文件",
+    },
+    ".rtf": {
+        "name": "RTF 文档 (.rtf)",
+        "desc": "富文本格式（需 Windows + Microsoft Word）",
+        "targets": {
+            ".docx": "转为 Word 文档",
+            ".pdf": "转为 PDF",
+            ".txt": "提取纯文本",
+        },
+        "example": "一份 RTF 格式文档",
+    },
+    ".odt": {
+        "name": "ODT 文档 (.odt)",
+        "desc": "OpenDocument 文本（需 LibreOffice 或 pandoc）",
+        "targets": {
+            ".docx": "转为 Word 文档（需 LibreOffice）",
+            ".pdf": "转为 PDF（需 LibreOffice）",
+            ".txt": "提取纯文本（需 LibreOffice）",
+        },
+        "example": "LibreOffice Writer 文档",
+    },
+    ".md": {
+        "name": "Markdown (.md)",
+        "desc": "Markdown 标记语言",
+        "targets": {
+            ".html": "转为 HTML 网页",
+            ".docx": "转为 Word 文档",
+            ".txt": "提取纯文本",
+            ".pdf": "转为 PDF（需 reportlab）",
+        },
+        "example": "README.md",
+    },
+    ".html": {
+        "name": "HTML 网页 (.html/.htm)",
+        "desc": "超文本标记语言",
+        "targets": {
+            ".pdf": "转为 PDF（需 weasyprint/pdfkit）",
+            ".txt": "提取纯文本",
+            ".docx": "转为 Word 文档",
+            ".md": "转为 Markdown",
+        },
+        "example": "一个静态网页",
+    },
+    ".xls": {
+        "name": "Excel 旧版 (.xls)",
+        "desc": "Microsoft Excel 97-2003（需 Windows + Excel）",
+        "targets": {
+            ".xlsx": "转为新版 Excel",
+            ".csv": "转为 CSV",
+            ".pdf": "转为 PDF",
+            ".txt": "提取文本",
+        },
+        "example": "旧版 Excel 表格",
+    },
+    ".xlsx": {
+        "name": "Excel 表格 (.xlsx)",
+        "desc": "Microsoft Excel 2007+ 电子表格",
+        "targets": {
+            ".csv": "转为 CSV",
+            ".json": "转为 JSON",
+            ".xml": "转为 XML",
+            ".txt": "转为纯文本",
+            ".docx": "转为 Word",
+            ".html": "转为 HTML",
+        },
+        "example": "一个包含姓名、年龄、城市的表格",
+    },
+    ".csv": {
+        "name": "CSV 文件 (.csv)",
+        "desc": "逗号分隔值文件",
+        "targets": {
+            ".xlsx": "转为 Excel",
+            ".json": "转为 JSON",
+            ".xml": "转为 XML",
+            ".txt": "转为纯文本",
+            ".docx": "转为 Word",
+            ".html": "转为 HTML",
+        },
+        "example": "姓名,年龄,城市\\n张三,25,北京",
+    },
+    ".ppt": {
+        "name": "PPT 旧版 (.ppt)",
+        "desc": "Microsoft PowerPoint 97-2003（需 Windows + PowerPoint）",
+        "targets": {
+            ".pptx": "转为新版 PPT",
+            ".pdf": "转为 PDF",
+        },
+        "example": "旧版 PowerPoint 演示文稿",
+    },
+    ".pptx": {
+        "name": "PPT 演示 (.pptx)",
+        "desc": "Microsoft PowerPoint 2007+（需 Windows + PowerPoint）",
+        "targets": {
+            ".pdf": "转为 PDF",
+        },
+        "example": "新版 PowerPoint 演示文稿",
+    },
+    ".jpg": {
+        "name": "JPEG 图像 (.jpg/.jpeg)",
+        "desc": "JPEG 压缩图像",
+        "targets": {
+            ".png": "转为 PNG",
+            ".gif": "转为 GIF",
+            ".tiff": "转为 TIFF",
+            ".webp": "转为 WebP",
+            ".bmp": "转为 BMP",
+        },
+        "example": "一张照片",
+    },
+    ".png": {
+        "name": "PNG 图像 (.png)",
+        "desc": "无损压缩图像",
+        "targets": {
+            ".jpg": "转为 JPEG",
+            ".jpeg": "转为 JPEG",
+            ".gif": "转为 GIF",
+            ".tiff": "转为 TIFF",
+            ".webp": "转为 WebP",
+            ".bmp": "转为 BMP",
+        },
+        "example": "一张带透明通道的图",
+    },
+    ".gif": {
+        "name": "GIF 图像 (.gif)",
+        "desc": "动态/静态 GIF 图像",
+        "targets": {
+            ".jpg": "转为 JPEG",
+            ".jpeg": "转为 JPEG",
+            ".png": "转为 PNG",
+            ".tiff": "转为 TIFF",
+            ".webp": "转为 WebP",
+            ".bmp": "转为 BMP",
+        },
+        "example": "一张动图或静态 GIF",
+    },
+    ".webp": {
+        "name": "WebP 图像 (.webp)",
+        "desc": "WebP 格式图像",
+        "targets": {
+            ".jpg": "转为 JPEG",
+            ".jpeg": "转为 JPEG",
+            ".png": "转为 PNG",
+            ".gif": "转为 GIF",
+            ".tiff": "转为 TIFF",
+            ".bmp": "转为 BMP",
+        },
+        "example": "一张 WebP 图片",
+    },
+    ".tiff": {
+        "name": "TIFF 图像 (.tiff)",
+        "desc": "标签图像文件格式",
+        "targets": {
+            ".jpg": "转为 JPEG",
+            ".jpeg": "转为 JPEG",
+            ".png": "转为 PNG",
+            ".gif": "转为 GIF",
+            ".webp": "转为 WebP",
+            ".bmp": "转为 BMP",
+        },
+        "example": "一张 TIFF 扫描件",
+    },
+    ".bmp": {
+        "name": "BMP 图像 (.bmp)",
+        "desc": "位图图像",
+        "targets": {
+            ".jpg": "转为 JPEG",
+            ".jpeg": "转为 JPEG",
+            ".png": "转为 PNG",
+            ".gif": "转为 GIF",
+            ".tiff": "转为 TIFF",
+            ".webp": "转为 WebP",
+        },
+        "example": "一张 BMP 图片",
+    },
+    ".svg": {
+        "name": "SVG 矢量图 (.svg)",
+        "desc": "可缩放矢量图形（需 cairosvg 或 reportlab）",
+        "targets": {
+            ".png": "转为 PNG（需 cairosvg）",
+            ".jpg": "转为 JPEG（需 cairosvg）",
+            ".jpeg": "转为 JPEG（需 cairosvg）",
+        },
+        "example": "一个 SVG 图标",
+    },
+    ".wav": {
+        "name": "WAV 音频 (.wav)",
+        "desc": "波形音频文件",
+        "targets": {
+            ".aiff": "转为 AIFF",
+            ".au": "转为 AU",
+            ".mp3": "转为 MP3（需 pydub + ffmpeg）",
+        },
+        "example": "一个 WAV 录音",
+    },
+    ".aiff": {
+        "name": "AIFF 音频 (.aiff)",
+        "desc": "音频交换文件格式",
+        "targets": {
+            ".wav": "转为 WAV",
+            ".au": "转为 AU",
+            ".mp3": "转为 MP3（需 pydub + ffmpeg）",
+        },
+        "example": "一个 AIFF 音频",
+    },
+    ".au": {
+        "name": "AU 音频 (.au)",
+        "desc": "Sun 音频文件",
+        "targets": {
+            ".wav": "转为 WAV",
+            ".aiff": "转为 AIFF",
+            ".mp3": "转为 MP3（需 pydub + ffmpeg）",
+        },
+        "example": "一个 AU 音频",
+    },
+    ".xml": {
+        "name": "XML 文件 (.xml)",
+        "desc": "可扩展标记语言",
+        "targets": {
+            ".json": "转为 JSON",
+            ".csv": "转为 CSV",
+        },
+        "example": "<root><item>...</item></root>",
+    },
+    ".json": {
+        "name": "JSON 文件 (.json)",
+        "desc": "JavaScript 对象表示法",
+        "targets": {
+            ".csv": "转为 CSV",
+            ".xml": "转为 XML",
+        },
+        "example": '[{"name":"张三","age":25}]',
+    },
+}
+
+
+# ==================== 转换引擎 ====================
+
+def _check_file(input_path: str, ext: str, target_ext: str):
+    if not os.path.exists(input_path):
+        raise ConversionError(ConversionError.TYPE_FILE_NOT_FOUND, f"文件不存在: {input_path}")
+    if os.path.getsize(input_path) == 0:
+        raise ConversionError(ConversionError.TYPE_EMPTY_FILE, "文件大小为 0 字节")
+    if ext not in SUPPORTED_EXTS:
+        raise ConversionError(ConversionError.TYPE_UNSUPPORTED, f"源格式 '{ext}' 不支持")
+    allowed = CONVERSION_MAP.get(ext, [])
+    if target_ext not in allowed:
+        raise ConversionError(ConversionError.TYPE_UNSUPPORTED,
+                              f"不支持 {ext} -> {target_ext}，仅支持: {', '.join(allowed)}")
+    # 依赖检查
+    if ext in (".docx", ".doc", ".rtf", ".odt") or target_ext in (".docx",):
+        if Document is None:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 python-docx")
+    if ext in (".xlsx", ".csv") or target_ext in (".xlsx", ".csv"):
+        if pd is None:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 pandas")
+    if ext == ".pdf" and target_ext == ".txt":
+        if PdfReader is None:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 PyPDF2")
+    if ext == ".pdf" and target_ext == ".docx":
+        if Converter is None:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 pdf2docx")
+    if target_ext == ".pdf" and ext in (".txt", ".md", ".html", ".htm"):
+        if canvas is None:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 reportlab")
+    if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".bmp", ".svg") or \
+       target_ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".bmp"):
+        if Image is None:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 Pillow")
+    if ext in (".wav", ".aiff", ".au") or target_ext in (".wav", ".aiff", ".au"):
+        pass  # 标准库 + pydub 可选
+    # Office COM 检查
+    if ext in (".doc", ".rtf", ".odt") or (ext == ".docx" and target_ext in (".doc",)):
+        if win32com_client is None:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 pywin32，无法转换 Office 旧版格式")
+    if ext in (".xls",) or (ext == ".xlsx" and target_ext in (".xls",)):
+        if win32com_client is None:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 pywin32，无法转换 Excel 旧版格式")
+    if ext in (".ppt", ".pptx"):
+        if win32com_client is None:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 pywin32，无法转换 PPT 格式")
+
+
+def _office_convert(input_path: str, output_path: str, source_ext: str, target_ext: str):
+    """使用 Windows Office COM 进行转换"""
+    if win32com_client is None:
+        raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 pywin32")
+    app = None
+    doc = None
+    try:
+        if source_ext in (".doc", ".docx", ".rtf", ".odt"):
+            app = win32com_client.Dispatch("Word.Application")
+            app.Visible = False
+            app.DisplayAlerts = 0
+            # 0=wdFormatDocument, 17=wdFormatDocumentDefault(docx), 13=wdFormatPDF, 7=wdFormatRTF, 2=wdFormatText
+            fmt_map = {".docx": 16, ".pdf": 17, ".txt": 7, ".rtf": 6}
+            fmt = fmt_map.get(target_ext, 16)
+            doc = app.Documents.Open(os.path.abspath(input_path))
+            doc.SaveAs(os.path.abspath(output_path), FileFormat=fmt)
+        elif source_ext in (".xls", ".xlsx"):
+            app = win32com_client.Dispatch("Excel.Application")
+            app.Visible = False
+            app.DisplayAlerts = False
+            wb = app.Workbooks.Open(os.path.abspath(input_path))
+            if target_ext == ".pdf":
+                wb.ExportAsFixedFormat(0, os.path.abspath(output_path))
+            elif target_ext == ".csv":
+                wb.SaveAs(os.path.abspath(output_path), FileFormat=6)
+            elif target_ext == ".xlsx":
+                wb.SaveAs(os.path.abspath(output_path), FileFormat=51)
+            elif target_ext == ".txt":
+                wb.SaveAs(os.path.abspath(output_path), FileFormat=-4158)
+            else:
+                wb.SaveAs(os.path.abspath(output_path))
+            wb.Close()
+        elif source_ext in (".ppt", ".pptx"):
+            app = win32com_client.Dispatch("PowerPoint.Application")
+            app.Visible = False
+            app.DisplayAlerts = False
+            pres = app.Presentations.Open(os.path.abspath(input_path), WithWindow=False)
+            if target_ext == ".pdf":
+                pres.SaveAs(os.path.abspath(output_path), 32)
+            elif target_ext == ".pptx":
+                pres.SaveAs(os.path.abspath(output_path), 24)
+            pres.Close()
+        else:
+            raise ConversionError(ConversionError.TYPE_UNSUPPORTED, f"Office COM 不支持 {source_ext} -> {target_ext}")
+    except Exception as e:
+        raise ConversionError(ConversionError.TYPE_FAILED, f"Office COM 转换失败（确保已安装对应 Office 软件）: {e}")
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(SaveChanges=False)
+            except Exception:
+                pass
+        if app is not None:
+            try:
+                app.Quit()
+            except Exception:
+                pass
+
+
+def _image_convert(input_path: str, output_path: str, target_ext: str):
+    """图像格式转换（Pillow）"""
+    if Image is None:
+        raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 Pillow")
+    try:
+        img = Image.open(input_path)
+    except Exception as e:
+        raise ConversionError(ConversionError.TYPE_CORRUPTED, f"无法打开图像: {e}")
+    # 处理透明通道（JPEG 不支持透明度）
+    if target_ext in (".jpg", ".jpeg") and img.mode in ("RGBA", "P"):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        if img.mode == "P":
+            img = img.convert("RGBA")
+        bg.paste(img, mask=img.split()[3])
+        img = bg
+    fmt_map = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG", ".gif": "GIF",
+               ".tiff": "TIFF", ".webp": "WEBP", ".bmp": "BMP"}
+    fmt = fmt_map.get(target_ext, target_ext.upper().lstrip("."))
+    try:
+        img.save(output_path, format=fmt)
+    except Exception as e:
+        raise ConversionError(ConversionError.TYPE_FAILED, f"图像保存失败: {e}")
+
+
+def _audio_convert(input_path: str, output_path: str, target_ext: str):
+    """音频格式转换"""
+    ext = Path(input_path).suffix.lower()
+    if AudioSegment is not None:
+        try:
+            audio = AudioSegment.from_file(input_path)
+            audio.export(output_path, format=target_ext.lstrip("."))
+            return
+        except Exception:
+            pass
+    # 回退到标准库（仅支持 wav/aiff/au 互转）
+    import wave, aifc, sunau
+    try:
+        if ext == ".wav" and target_ext == ".aiff":
+            with wave.open(input_path, "rb") as w:
+                data = w.readframes(w.getnframes())
+                params = (w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes(), w.getcomptype().encode(), w.getcompname().encode())
+            with aifc.open(output_path, "wb") as a:
+                a.setparams(params)
+                a.writeframes(data)
+        elif ext == ".aiff" and target_ext == ".wav":
+            with aifc.open(input_path, "rb") as a:
+                data = a.readframes(a.getnframes())
+                params = (a.getnchannels(), a.getsampwidth(), a.getframerate(), a.getnframes(), a.getcomptype().encode(), a.getcompname().encode())
+            with wave.open(output_path, "wb") as w:
+                w.setparams(params)
+                w.writeframes(data)
+        else:
+            raise ConversionError(ConversionError.TYPE_MISSING_DEP, "该音频转换需要 pydub + ffmpeg，请执行: pip install pydub 并安装 ffmpeg")
+    except Exception as e:
+        raise ConversionError(ConversionError.TYPE_FAILED, f"音频转换失败: {e}")
+
+
+def convert_file(input_path: str, output_dir: str, target_ext: str) -> str:
+    ext = Path(input_path).suffix.lower()
+    basename = Path(input_path).stem
+    output_path = os.path.join(output_dir, basename + target_ext)
+    _check_file(input_path, ext, target_ext)
+
+    try:
+        # ========== Office COM 格式 ==========
+        if ext in (".doc", ".rtf", ".odt") or (ext == ".docx" and target_ext == ".doc"):
+            _office_convert(input_path, output_path, ext, target_ext)
+        elif ext in (".xls",) or (ext == ".xlsx" and target_ext == ".xls"):
+            _office_convert(input_path, output_path, ext, target_ext)
+        elif ext in (".ppt", ".pptx"):
+            _office_convert(input_path, output_path, ext, target_ext)
+
+        # ========== docx -> txt ==========
+        elif ext == ".docx" and target_ext == ".txt":
+            try:
+                doc = Document(input_path)
+            except Exception as e:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, f"无法解析 docx: {e}")
+            text = "\n".join([p.text for p in doc.paragraphs])
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+        # ========== docx -> pdf ==========
+        elif ext == ".docx" and target_ext == ".pdf":
+            if docx2pdf_convert is not None:
+                try:
+                    docx2pdf_convert(input_path, output_path)
+                except Exception:
+                    pass
+                else:
+                    return output_path
+            if canvas is not None:
+                try:
+                    doc = Document(input_path)
+                except Exception as e:
+                    raise ConversionError(ConversionError.TYPE_CORRUPTED, f"无法解析 docx: {e}")
+                text = "\n".join([p.text for p in doc.paragraphs])
+                if not text.strip():
+                    raise ConversionError(ConversionError.TYPE_EMPTY_FILE, "文档内容为空")
+                c = canvas.Canvas(output_path, pagesize=letter)
+                w, h = letter
+                y = h - 50
+                for line in text.splitlines():
+                    c.drawString(50, y, line)
+                    y -= 15
+                    if y < 50:
+                        c.showPage()
+                        y = h - 50
+                c.save()
+            else:
+                raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 docx2pdf 或 reportlab")
+
+        # ========== docx -> md / html ==========
+        elif ext == ".docx" and target_ext in (".md", ".html", ".htm"):
+            try:
+                doc = Document(input_path)
+            except Exception as e:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, f"无法解析 docx: {e}")
+            text = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+            if target_ext in (".html", ".htm"):
+                html = "<html><body>" + "\n".join(f"<p>{p}</p>" for p in text.splitlines() if p.strip()) + "</body></html>"
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+            else:
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+
+        # ========== pdf -> txt ==========
+        elif ext == ".pdf" and target_ext == ".txt":
+            try:
+                reader = PdfReader(input_path)
+            except Exception as e:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, f"无法解析 PDF: {e}")
+            parts = []
+            for page in reader.pages:
+                try:
+                    txt = page.extract_text()
+                except Exception:
+                    continue
+                if txt:
+                    parts.append(txt)
+            text = "\n".join(parts)
+            if not text.strip():
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, "PDF 无文本（可能是扫描版）")
+            with open(output_path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+        # ========== pdf -> docx ==========
+        elif ext == ".pdf" and target_ext == ".docx":
+            if Converter is None:
+                raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 pdf2docx")
+            try:
+                cv = Converter(input_path)
+                cv.convert(output_path, start=0, end=None)
+                cv.close()
+            except Exception as e:
+                raise ConversionError(ConversionError.TYPE_FAILED, f"pdf2docx 转换失败: {e}")
+
+        # ========== txt -> docx / pdf / csv / md / html ==========
+        elif ext == ".txt":
+            try:
+                with open(input_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except UnicodeDecodeError:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, "文本编码错误，请确保为 UTF-8")
+            if target_ext == ".docx":
+                doc = Document()
+                for line in text.splitlines():
+                    doc.add_paragraph(line)
+                doc.save(output_path)
+            elif target_ext == ".pdf":
+                if canvas is None:
+                    raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 reportlab")
+                c = canvas.Canvas(output_path, pagesize=letter)
+                w, h = letter
+                y = h - 50
+                for line in text.splitlines():
+                    c.drawString(50, y, line)
+                    y -= 15
+                    if y < 50:
+                        c.showPage()
+                        y = h - 50
+                c.save()
+            elif target_ext == ".csv":
+                with open(output_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    for line in text.splitlines():
+                        writer.writerow([line.strip()])
+            elif target_ext in (".md", ".html", ".htm"):
+                with open(output_path, "w", encoding="utf-8") as f:
+                    if target_ext in (".html", ".htm"):
+                        f.write("<html><body><pre>" + text + "</pre></body></html>")
+                    else:
+                        f.write(text)
+
+        # ========== md -> html / docx / txt / pdf ==========
+        elif ext == ".md":
+            try:
+                with open(input_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except UnicodeDecodeError:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, "编码错误")
+            if target_ext in (".html", ".htm"):
+                if markdown is not None:
+                    html = markdown.markdown(text)
+                else:
+                    html = "<pre>" + text + "</pre>"
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+            elif target_ext == ".txt":
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+            elif target_ext == ".docx":
+                doc = Document()
+                for line in text.splitlines():
+                    doc.add_paragraph(line)
+                doc.save(output_path)
+            elif target_ext == ".pdf":
+                if canvas is None:
+                    raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 reportlab")
+                c = canvas.Canvas(output_path, pagesize=letter)
+                w, h = letter
+                y = h - 50
+                for line in text.splitlines():
+                    c.drawString(50, y, line)
+                    y -= 15
+                    if y < 50:
+                        c.showPage()
+                        y = h - 50
+                c.save()
+
+        # ========== html -> pdf / txt / docx / md ==========
+        elif ext in (".html", ".htm"):
+            try:
+                with open(input_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except UnicodeDecodeError:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, "编码错误")
+            if target_ext == ".txt":
+                # 简单去除标签
+                import re
+                plain = re.sub(r'<[^>]+>', '', text)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(plain)
+            elif target_ext == ".docx":
+                doc = Document()
+                import re
+                plain = re.sub(r'<[^>]+>', '', text)
+                for line in plain.splitlines():
+                    if line.strip():
+                        doc.add_paragraph(line)
+                doc.save(output_path)
+            elif target_ext == ".md":
+                import re
+                plain = re.sub(r'<[^>]+>', '', text)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(plain)
+            elif target_ext == ".pdf":
+                if canvas is None:
+                    raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 reportlab")
+                import re
+                plain = re.sub(r'<[^>]+>', '', text)
+                c = canvas.Canvas(output_path, pagesize=letter)
+                w, h = letter
+                y = h - 50
+                for line in plain.splitlines():
+                    c.drawString(50, y, line)
+                    y -= 15
+                    if y < 50:
+                        c.showPage()
+                        y = h - 50
+                c.save()
+
+        # ========== xlsx / csv -> 多种格式 ==========
+        elif ext in (".xlsx", ".csv") and target_ext in (".xlsx", ".csv", ".json", ".xml", ".txt", ".docx", ".html", ".htm"):
+            try:
+                if ext == ".xlsx":
+                    df = pd.read_excel(input_path)
+                else:
+                    df = pd.read_csv(input_path, encoding="utf-8")
+            except UnicodeDecodeError:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, "CSV 编码错误")
+            except Exception as e:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, f"无法读取表格: {e}")
+            if df.empty:
+                raise ConversionError(ConversionError.TYPE_EMPTY_FILE, "表格无数据")
+            if target_ext == ".xlsx":
+                df.to_excel(output_path, index=False)
+            elif target_ext == ".csv":
+                df.to_csv(output_path, index=False, encoding="utf-8")
+            elif target_ext == ".json":
+                df.to_json(output_path, orient="records", force_ascii=False, indent=2)
+            elif target_ext == ".xml":
+                root = ET.Element("root")
+                for _, row in df.iterrows():
+                    item = ET.SubElement(root, "item")
+                    for col in df.columns:
+                        child = ET.SubElement(item, str(col).replace(" ", "_").replace("/", "_"))
+                        child.text = str(row[col])
+                ET.ElementTree(root).write(output_path, encoding="utf-8", xml_declaration=True)
+            elif target_ext == ".txt":
+                with open(output_path, "w", encoding="utf-8") as f:
+                    f.write(df.to_string())
+            elif target_ext == ".docx":
+                doc = Document()
+                doc.add_heading(basename, level=1)
+                for col in df.columns:
+                    doc.add_heading(str(col), level=2)
+                    for val in df[col].astype(str):
+                        doc.add_paragraph(val)
+                doc.save(output_path)
+            elif target_ext in (".html", ".htm"):
+                df.to_html(output_path, index=False)
+
+        # ========== xml -> json / csv ==========
+        elif ext == ".xml" and target_ext in (".json", ".csv"):
+            try:
+                tree = ET.parse(input_path)
+            except ET.ParseError as e:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, f"XML 解析错误: {e}")
+            root = tree.getroot()
+            if target_ext == ".json":
+                def elem_to_dict(elem):
+                    d = {elem.tag: {} if elem.attrib else None}
+                    children = list(elem)
+                    if children:
+                        dd = {}
+                        for dc in map(elem_to_dict, children):
+                            for k, v in dc.items():
+                                if k in dd:
+                                    if not isinstance(dd[k], list):
+                                        dd[k] = [dd[k]]
+                                    dd[k].append(v)
+                                else:
+                                    dd[k] = v
+                        d = {elem.tag: dd}
+                    if elem.attrib:
+                        d[elem.tag].update(("@" + k, v) for k, v in elem.attrib.items())
+                    if elem.text and elem.text.strip():
+                        if children or elem.attrib:
+                            d[elem.tag]["#text"] = elem.text.strip()
+                        else:
+                            d[elem.tag] = elem.text.strip()
+                    return d
+                data = elem_to_dict(root)
+                with open(output_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            elif target_ext == ".csv":
+                items = []
+                for child in root:
+                    item = {}
+                    for sub in child:
+                        item[sub.tag] = sub.text or ""
+                    items.append(item)
+                if not items:
+                    raise ConversionError(ConversionError.TYPE_EMPTY_FILE, "XML 无数据节点")
+                with open(output_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(items[0].keys()))
+                    writer.writeheader()
+                    writer.writerows(items)
+
+        # ========== json -> csv / xml ==========
+        elif ext == ".json" and target_ext in (".csv", ".xml"):
+            try:
+                with open(input_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError as e:
+                raise ConversionError(ConversionError.TYPE_CORRUPTED, f"JSON 解析错误: {e}")
+            if target_ext == ".csv":
+                if isinstance(data, list) and data:
+                    pd.DataFrame(data).to_csv(output_path, index=False)
+                else:
+                    with open(output_path, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["json_data"])
+                        writer.writerow([json.dumps(data, ensure_ascii=False)])
+            elif target_ext == ".xml":
+                root = ET.Element("root")
+                def dict_to_xml(d, parent):
+                    if isinstance(d, dict):
+                        for k, v in d.items():
+                            child = ET.SubElement(parent, str(k).replace(" ", "_").replace("/", "_"))
+                            dict_to_xml(v, child)
+                    elif isinstance(d, list):
+                        for item in d:
+                            child = ET.SubElement(parent, "item")
+                            dict_to_xml(item, child)
+                    else:
+                        parent.text = str(d)
+                dict_to_xml(data, root)
+                ET.ElementTree(root).write(output_path, encoding="utf-8", xml_declaration=True)
+
+        # ========== 图像转换 ==========
+        elif ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".tiff", ".bmp"):
+            _image_convert(input_path, output_path, target_ext)
+
+        # ========== svg -> png / jpg ==========
+        elif ext == ".svg" and target_ext in (".png", ".jpg", ".jpeg"):
+            try:
+                from cairosvg import svg2png
+                if target_ext == ".png":
+                    svg2png(url=input_path, write_to=output_path)
+                else:
+                    import io
+                    png_data = svg2png(url=input_path)
+                    img = Image.open(io.BytesIO(png_data))
+                    img = img.convert("RGB")
+                    img.save(output_path, "JPEG")
+            except ImportError:
+                raise ConversionError(ConversionError.TYPE_MISSING_DEP, "缺少 cairosvg，请执行: pip install cairosvg")
+            except Exception as e:
+                raise ConversionError(ConversionError.TYPE_FAILED, f"SVG 转换失败: {e}")
+
+        # ========== 音频转换 ==========
+        elif ext in (".wav", ".aiff", ".au"):
+            _audio_convert(input_path, output_path, target_ext)
+
+        else:
+            raise ConversionError(ConversionError.TYPE_UNSUPPORTED, f"尚未实现 {ext} -> {target_ext}")
+
+    except ConversionError:
+        raise
+    except PermissionError as e:
+        raise ConversionError(ConversionError.TYPE_PERMISSION, f"权限不足: {e}")
+    except Exception as e:
+        raise ConversionError(ConversionError.TYPE_FAILED, f"转换异常: {e}")
+
+    return output_path
+
+
+# ==================== 格式说明弹窗 ====================
+
+class FormatHelpWindow(CTkToplevel):
+    def __init__(self, parent, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+        self.title("支持格式说明")
+        self.geometry("780x650")
+        self.minsize(650, 500)
+        self.transient(parent)
+        self.grab_set()
+        self.focus_force()
+        self.lift()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._build_ui()
+
+    def _build_ui(self):
+        header = CTkFrame(self, height=50, corner_radius=0, fg_color=("gray90", "gray13"))
+        header.pack(fill="x", padx=0, pady=0)
+        header.pack_propagate(False)
+        CTkLabel(header, text="📋 支持格式与转换说明", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left", padx=20, pady=10)
+
+        content = CTkScrollableFrame(self, corner_radius=0, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=15)
+
+        for ext, info in FORMAT_DESCRIPTIONS.items():
+            card = CTkFrame(content, corner_radius=12, fg_color=("white", "gray16"))
+            card.pack(fill="x", pady=(0, 12))
+            CTkLabel(card, text=info["name"], font=ctk.CTkFont(size=15, weight="bold")).pack(anchor="w", padx=15, pady=(12, 2))
+            CTkLabel(card, text=info["desc"], font=ctk.CTkFont(size=12), text_color=("gray50", "gray60")).pack(anchor="w", padx=15, pady=(0, 6))
+            targets = info.get("targets", {})
+            if targets:
+                target_text = "可转换为:\n" + "\n".join(f"  • {tgt}  —  {desc}" for tgt, desc in targets.items())
+                CTkLabel(card, text=target_text, font=ctk.CTkFont(size=12), justify="left").pack(anchor="w", padx=15, pady=(0, 4))
+            example = info.get("example", "")
+            if example:
+                CTkLabel(card, text=f"示例: {example}", font=ctk.CTkFont(size=11, slant="italic"),
+                         text_color=("gray40", "gray70")).pack(anchor="w", padx=15, pady=(4, 12))
+
+        bottom = CTkFrame(self, height=50, fg_color="transparent")
+        bottom.pack(fill="x", padx=20, pady=(0, 15))
+        bottom.pack_propagate(False)
+        CTkButton(bottom, text="关闭", width=100, command=self._on_close).pack(side="right")
+
+    def _on_close(self):
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+
+# ==================== 主 GUI ====================
+
+class FileTransferApp(CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("文件类型转换工具")
+        self.geometry("1200x880")
+        self.minsize(1000, 720)
+
+        self.source_files = []
+        self.output_files = []
+        self.output_dir = os.path.join(os.path.expanduser("~"), "Documents", "TransferOutput")
+        os.makedirs(self.output_dir, exist_ok=True)
+        self._help_window = None
+        self._executor = None
+
+        self._build_sidebar()
+        self._build_main_area()
+
+        if _tkdnd_available and DND_FILES is not None:
+            import tkinterdnd2.TkinterDnD as tkdnd_core
+            tkdnd_core._require(self)
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind('<<Drop>>', self._on_drop)
+
+    def _build_sidebar(self):
+        self.sidebar = CTkFrame(self, width=220, corner_radius=0)
+        self.sidebar.pack(side="left", fill="y", padx=0, pady=0)
+        self.sidebar.pack_propagate(False)
+
+        CTkLabel(self.sidebar, text="Transfer", font=ctk.CTkFont(size=26, weight="bold")).pack(pady=(30, 5))
+        CTkLabel(self.sidebar, text="文件类型转换工具", font=ctk.CTkFont(size=12), text_color=("gray50", "gray60")).pack(pady=(0, 25))
+
+        CTkButton(self.sidebar, text="▶ 开始转换", font=ctk.CTkFont(size=15, weight="bold"),
+                  height=45, corner_radius=10, command=self._start_convert).pack(fill="x", padx=15, pady=(20, 10))
+
+        btn_sec = {"font": ctk.CTkFont(size=13), "height": 36, "corner_radius": 10, "fg_color": "transparent", "border_width": 2}
+        CTkButton(self.sidebar, text="📋 格式说明", command=self._open_format_help, **btn_sec).pack(fill="x", padx=15, pady=(5, 10))
+
+        CTkButton(self.sidebar, text="📝 填入示例", command=self._paste_sample, **btn_sec).pack(fill="x", padx=15, pady=(5, 10))
+
+        theme_card = CTkFrame(self.sidebar, corner_radius=12, fg_color=("gray90", "gray17"))
+        theme_card.pack(fill="x", padx=15, pady=(20, 10))
+        CTkLabel(theme_card, text="外观主题", font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=12, pady=(10, 5))
+        self.theme_switch = CTkSwitch(theme_card, text="深色模式", command=self._toggle_theme, onvalue="dark", offvalue="light")
+        self.theme_switch.pack(anchor="w", padx=12, pady=(0, 12))
+        current = ctk.get_appearance_mode().lower()
+        self.theme_switch.select() if current == "dark" else self.theme_switch.deselect()
+
+        CTkLabel(self.sidebar, text="v3.0  Batch Edition", font=ctk.CTkFont(size=11), text_color=("gray50", "gray60")).pack(side="bottom", pady=15)
+
+    def _build_main_area(self):
+        self.main_area = CTkFrame(self, corner_radius=0, fg_color=("gray95", "gray10"))
+        self.main_area.pack(side="right", fill="both", expand=True, padx=0, pady=0)
+
+        header = CTkFrame(self.main_area, height=60, corner_radius=0, fg_color=("gray90", "gray13"))
+        header.pack(fill="x", padx=0, pady=0)
+        header.pack_propagate(False)
+        CTkLabel(header, text="文件类型转换工作台", font=ctk.CTkFont(size=18, weight="bold")).pack(side="left", padx=25, pady=10)
+
+        content = CTkFrame(self.main_area, corner_radius=0, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=15)
+
+        # ---------- 源文件区域 ----------
+        src_card = CTkFrame(content, corner_radius=16, fg_color=("white", "gray16"))
+        src_card.pack(fill="both", expand=True, pady=(0, 10))
+        src_card.pack_propagate(False)
+        src_card.configure(height=280)
+
+        src_header = CTkFrame(src_card, corner_radius=0, fg_color="transparent", height=40)
+        src_header.pack(fill="x", padx=15, pady=(10, 0))
+        src_header.pack_propagate(False)
+        CTkLabel(src_header, text="📥 源文件（支持拖拽文件/文件夹到窗口）", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=5)
+
+        btn_style = {"width": 110, "height": 32, "corner_radius": 8, "font": ctk.CTkFont(size=12)}
+        CTkButton(src_header, text="添加文件", command=self._add_files, **btn_style).pack(side="right", padx=(5, 0))
+        CTkButton(src_header, text="添加文件夹", command=self._add_folder, **btn_style).pack(side="right", padx=(5, 0))
+        CTkButton(src_header, text="🗑️ 清空输入", command=self._clear_files,
+                  width=90, height=32, corner_radius=8, font=ctk.CTkFont(size=12),
+                  fg_color="transparent", border_width=1, hover_color=("gray85", "gray25")).pack(side="right", padx=(5, 0))
+
+        self.file_list_frame = CTkScrollableFrame(src_card, corner_radius=10, fg_color=("gray98", "gray14"))
+        self.file_list_frame.pack(fill="both", expand=True, padx=15, pady=(8, 12))
+
+        # ---------- 设置区域 ----------
+        cfg_card = CTkFrame(content, corner_radius=16, fg_color=("white", "gray16"))
+        cfg_card.pack(fill="x", pady=(0, 10))
+        cfg_card.pack_propagate(False)
+        cfg_card.configure(height=90)
+
+        cfg_row = CTkFrame(cfg_card, corner_radius=0, fg_color="transparent")
+        cfg_row.pack(fill="x", padx=15, pady=(15, 0))
+
+        CTkLabel(cfg_row, text="🎯 目标格式:", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(0, 8))
+        self.format_combo = CTkComboBox(cfg_row, values=["请先添加文件"], state="readonly", width=160)
+        self.format_combo.set("请先添加文件")
+        self.format_combo.pack(side="left", padx=(0, 20))
+
+        CTkLabel(cfg_row, text="📁 输出目录:", font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=(0, 8))
+        self.output_entry = CTkEntry(cfg_row, width=350, height=32, border_width=1)
+        self.output_entry.insert(0, self.output_dir)
+        self.output_entry.pack(side="left", padx=(0, 8))
+        CTkButton(cfg_row, text="浏览...", width=70, height=32, corner_radius=8,
+                  command=self._choose_output_dir).pack(side="left", padx=(5, 0))
+        CTkButton(cfg_row, text="🗑️ 清空输出", command=self._clear_outputs,
+                  width=90, height=32, corner_radius=8, font=ctk.CTkFont(size=12),
+                  fg_color="transparent", border_width=1, hover_color=("gray85", "gray25")).pack(side="left")
+
+        # ---------- 进度区域 ----------
+        self.progress_bar = CTkProgressBar(content, height=8, corner_radius=4)
+        self.progress_bar.pack(fill="x", pady=(0, 10))
+        self.progress_bar.set(0)
+        self.progress_bar.pack_forget()
+
+        self.progress_label = CTkLabel(content, text="", font=ctk.CTkFont(size=12), text_color=("gray50", "gray60"))
+        self.progress_label.pack(anchor="w", padx=5)
+        self.progress_label.pack_forget()
+
+        # ---------- 结果区域 ----------
+        result_card = CTkFrame(content, corner_radius=16, fg_color=("white", "gray16"))
+        result_card.pack(fill="both", expand=True, pady=(0, 10))
+        result_card.pack_propagate(False)
+        result_card.configure(height=280)
+
+        result_header = CTkFrame(result_card, corner_radius=0, fg_color="transparent", height=40)
+        result_header.pack(fill="x", padx=15, pady=(10, 0))
+        result_header.pack_propagate(False)
+        CTkLabel(result_header, text="📤 转换结果", font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=5)
+        self.result_stats = CTkLabel(result_header, text="等待转换...", font=ctk.CTkFont(size=12), text_color=("gray50", "gray60"))
+        self.result_stats.pack(side="right", padx=5)
+
+        self.result_list_frame = CTkScrollableFrame(result_card, corner_radius=10, fg_color=("gray98", "gray14"))
+        self.result_list_frame.pack(fill="both", expand=True, padx=15, pady=(8, 12))
+
+        # 状态栏
+        self.status_label = CTkLabel(content, text="就绪", font=ctk.CTkFont(size=12), text_color=("gray50", "gray60"))
+        self.status_label.pack(anchor="w", padx=5)
+
+    # ==================== 事件处理 ====================
+
+    def _open_format_help(self):
+        if self._help_window and self._help_window.winfo_exists():
+            self._help_window.lift()
+            self._help_window.focus_force()
+            return
+        self._help_window = FormatHelpWindow(self)
+
+    def _paste_sample(self):
+        tmpdir = tempfile.gettempdir()
+        count = 0
+        if pd is not None:
+            sample_xlsx = os.path.join(tmpdir, "示例_员工信息表.xlsx")
+            df = pd.DataFrame({
+                "姓名": ["张三", "李四", "王五"],
+                "年龄": [25, 30, 28],
+                "城市": ["北京", "上海", "广州"],
+            })
+            df.to_excel(sample_xlsx, index=False)
+            if self._add_file(sample_xlsx):
+                count += 1
+
+        sample_txt = os.path.join(tmpdir, "示例_日志.txt")
+        with open(sample_txt, "w", encoding="utf-8") as f:
+            f.write("2024-01-15 09:00:00 系统启动\n")
+            f.write("2024-01-15 09:05:23 用户登录: admin\n")
+            f.write("2024-01-15 09:10:11 数据同步完成\n")
+        if self._add_file(sample_txt):
+            count += 1
+
+        sample_json = os.path.join(tmpdir, "示例_数据.json")
+        with open(sample_json, "w", encoding="utf-8") as f:
+            json.dump([
+                {"product": "A", "price": 100, "qty": 5},
+                {"product": "B", "price": 200, "qty": 3},
+            ], f, ensure_ascii=False, indent=2)
+        if self._add_file(sample_json):
+            count += 1
+
+        if Image is not None:
+            sample_png = os.path.join(tmpdir, "示例_图片.png")
+            img = Image.new("RGB", (200, 100), color=(73, 109, 137))
+            img.save(sample_png)
+            if self._add_file(sample_png):
+                count += 1
+
+        self.status_label.configure(text=f"已填入 {count} 个示例文件（源文件为临时文件）")
+        self._update_format_combo()
+
+    def _on_drop(self, event):
+        data = event.data
+        files = self._parse_drop_files(data)
+        added = 0
+        for f in files:
+            if os.path.isfile(f):
+                if self._add_file(f):
+                    added += 1
+            elif os.path.isdir(f):
+                cnt = self._add_folder_recursive(f)
+                added += cnt
+        self.status_label.configure(text=f"拖拽导入 {added} 个文件")
+        self._update_format_combo()
+
+    def _parse_drop_files(self, data: str):
+        data = data.strip()
+        if '\n' in data:
+            files = [f.strip() for f in data.split('\n') if f.strip()]
+        else:
+            files = []
+            temp = ""
+            in_brace = False
+            for char in data:
+                if char == '{':
+                    in_brace = True
+                elif char == '}':
+                    in_brace = False
+                elif char == ' ' and not in_brace:
+                    if temp:
+                        files.append(temp)
+                        temp = ""
+                    continue
+                else:
+                    temp += char
+            if temp:
+                files.append(temp)
+        cleaned = []
+        for f in files:
+            f = f.strip().strip('"').strip("'")
+            if f.startswith("file://"):
+                f = f[7:]
+            cleaned.append(f)
+        return cleaned
+
+    def _add_files(self):
+        paths = filedialog.askopenfilenames(
+            filetypes=[("All Supported", "*.doc *.docx *.pdf *.txt *.rtf *.odt *.md *.html *.htm *.xls *.xlsx *.csv *.ppt *.pptx *.jpg *.jpeg *.png *.gif *.webp *.tiff *.bmp *.svg *.wav *.aiff *.au *.xml *.json"),
+                       ("All files", "*.*")]
+        )
+        added = 0
+        for p in paths:
+            if self._add_file(p):
+                added += 1
+        self.status_label.configure(text=f"添加 {added} 个文件")
+        self._update_format_combo()
+
+    def _add_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            cnt = self._add_folder_recursive(folder)
+            self.status_label.configure(text=f"递归添加 {cnt} 个文件")
+            self._update_format_combo()
+
+    def _add_folder_recursive(self, folder: str) -> int:
+        count = 0
+        for root, _, files in os.walk(folder):
+            for name in files:
+                ext = Path(name).suffix.lower()
+                if ext in SUPPORTED_EXTS:
+                    full = os.path.join(root, name)
+                    if self._add_file(full):
+                        count += 1
+        return count
+
+    def _add_file(self, path: str) -> bool:
+        if path in self.source_files:
+            return False
+        ext = Path(path).suffix.lower()
+        if ext not in SUPPORTED_EXTS:
+            self.status_label.configure(text=f"跳过不支持的文件: {os.path.basename(path)}")
+            return False
+        self.source_files.append(path)
+        self._render_file_list()
+        return True
+
+    def _render_file_list(self):
+        for widget in self.file_list_frame.winfo_children():
+            widget.destroy()
+        for path in self.source_files:
+            row = CTkFrame(self.file_list_frame, corner_radius=8, fg_color=("gray90", "gray17"), height=36)
+            row.pack(fill="x", pady=(0, 4))
+            row.pack_propagate(False)
+            name = os.path.basename(path)
+            size = self._format_size(os.path.getsize(path))
+            CTkLabel(row, text=f"{name}  ({size})", font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+            CTkButton(row, text="✕", width=28, height=28, corner_radius=6,
+                      command=lambda p=path: self._remove_file(p)).pack(side="right", padx=8)
+
+    def _remove_file(self, path: str):
+        if path in self.source_files:
+            self.source_files.remove(path)
+        self._render_file_list()
+        self._update_format_combo()
+
+    def _clear_files(self):
+        self.source_files.clear()
+        self._render_file_list()
+        self._update_format_combo()
+        self.status_label.configure(text="已清空输入文件列表")
+
+    def _clear_outputs(self):
+        cleared = 0
+        for f in self.output_files:
+            try:
+                if os.path.exists(f):
+                    os.remove(f)
+                    cleared += 1
+            except Exception:
+                pass
+        self.output_files.clear()
+        for widget in self.result_list_frame.winfo_children():
+            widget.destroy()
+        self.result_stats.configure(text="等待转换...")
+        self.status_label.configure(text=f"已清空 {cleared} 个输出文件")
+
+    def _format_size(self, size: int) -> str:
+        for unit in ["B", "KB", "MB", "GB"]:
+            if size < 1024:
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
+    def _update_format_combo(self):
+        if not self.source_files:
+            self.format_combo.configure(values=["请先添加文件"])
+            self.format_combo.set("请先添加文件")
+            return
+        first_ext = Path(self.source_files[0]).suffix.lower()
+        targets = CONVERSION_MAP.get(first_ext, [])
+        if targets:
+            self.format_combo.configure(values=targets)
+            self.format_combo.set(targets[0])
+        else:
+            self.format_combo.configure(values=["无可用格式"])
+            self.format_combo.set("无可用格式")
+
+    def _choose_output_dir(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.output_dir = folder
+            self.output_entry.delete(0, "end")
+            self.output_entry.insert(0, folder)
+
+    def _start_convert(self):
+        if not self.source_files:
+            messagebox.showwarning("提示", "请先添加待转换的文件")
+            return
+        target = self.format_combo.get()
+        if target not in SUPPORTED_EXTS:
+            messagebox.showwarning("提示", "请选择有效的目标格式")
+            return
+        self.output_dir = self.output_entry.get().strip() or self.output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # 清空旧结果
+        for widget in self.result_list_frame.winfo_children():
+            widget.destroy()
+        self.output_files.clear()
+
+        self.progress_bar.pack(fill="x", pady=(0, 5))
+        self.progress_bar.set(0)
+        self.progress_label.pack(anchor="w", padx=5)
+        self.progress_label.configure(text="准备转换...")
+
+        thread = threading.Thread(target=self._convert_worker, args=(target,), daemon=True)
+        thread.start()
+
+    def _convert_worker(self, target: str):
+        total = len(self.source_files)
+        success = 0
+        failed = 0
+        results = []
+
+        # 使用 ThreadPoolExecutor 进行大批量并发转换
+        max_workers = min(4, total)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_path = {
+                executor.submit(convert_file, path, self.output_dir, target): path
+                for path in self.source_files
+            }
+            completed = 0
+            for future in as_completed(future_to_path):
+                path = future_to_path[future]
+                completed += 1
+                try:
+                    out = future.result()
+                    success += 1
+                    results.append(("success", os.path.basename(path), out, None))
+                    self.output_files.append(out)
+                except ConversionError as ce:
+                    failed += 1
+                    results.append(("fail", os.path.basename(path), None, ce))
+                except Exception as e:
+                    failed += 1
+                    ce = ConversionError(ConversionError.TYPE_FAILED, str(e))
+                    results.append(("fail", os.path.basename(path), None, ce))
+
+                progress = completed / total
+                self.after(0, lambda p=progress, c=completed, t=total: self._update_progress(p, c, t))
+
+        self.after(0, lambda: self._on_convert_done(success, failed, results))
+
+    def _update_progress(self, progress: float, completed: int, total: int):
+        self.progress_bar.set(progress)
+        self.progress_label.configure(text=f"进度: {completed} / {total}")
+
+    def _on_convert_done(self, success: int, failed: int, results: list):
+        self.progress_bar.pack_forget()
+        self.progress_label.pack_forget()
+        self.result_stats.configure(text=f"成功: {success} / 失败: {failed}")
+        self.status_label.configure(text=f"转换完成，成功 {success} 个，失败 {failed} 个")
+
+        for status, name, out_path, err in results:
+            row = CTkFrame(self.result_list_frame, corner_radius=8, fg_color=("gray90", "gray17"), height=50)
+            row.pack(fill="x", pady=(0, 5))
+            row.pack_propagate(False)
+
+            if status == "success":
+                CTkLabel(row, text=f"✅  {name}", font=ctk.CTkFont(size=12), text_color="#27ae60").pack(side="left", padx=10)
+                CTkButton(row, text="打开目录", width=80, height=28, corner_radius=6,
+                          command=lambda p=out_path: self._open_file_dir(p)).pack(side="right", padx=5)
+                CTkButton(row, text="另存为...", width=80, height=28, corner_radius=6,
+                          command=lambda p=out_path: self._save_as(p)).pack(side="right", padx=5)
+            else:
+                err_type = err.err_type if err else "未知错误"
+                detail = err.detail if err else ""
+                CTkLabel(row, text=f"❌  {name}", font=ctk.CTkFont(size=12), text_color="#c0392b").pack(side="left", padx=10)
+                CTkLabel(row, text=f"[{err_type}] {detail[:50]}", font=ctk.CTkFont(size=11),
+                         text_color=("gray50", "gray60")).pack(side="left", padx=(5, 0))
+
+    def _open_file_dir(self, path: str):
+        if os.path.exists(path):
+            os.startfile(os.path.dirname(path))
+
+    def _save_as(self, path: str):
+        if not os.path.exists(path):
+            messagebox.showerror("错误", "文件不存在")
+            return
+        target = filedialog.asksaveasfilename(
+            defaultextension=Path(path).suffix,
+            initialfile=os.path.basename(path),
+            filetypes=[("All files", "*.*")],
+        )
+        if target:
+            try:
+                shutil.copy2(path, target)
+                messagebox.showinfo("成功", f"已保存到:\n{target}")
+            except Exception as e:
+                messagebox.showerror("错误", str(e))
+
+    def _toggle_theme(self):
+        mode = "Dark" if self.theme_switch.get() == "dark" else "Light"
+        ctk.set_appearance_mode(mode)
+
+
+def main():
+    app = FileTransferApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
